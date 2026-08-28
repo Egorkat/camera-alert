@@ -57,33 +57,29 @@ CAMERAS = [
 
 ## Running
 
-Each service is meant to run continuously (e.g. as a systemd unit):
+## Installation
+
+```bash
+git clone <repo-url> /opt/camera-alert
+cd /opt/camera-alert
+sudo ./install.sh
+```
+
+This installs system dependencies (`ffmpeg`, `python3-requests`), creates the
+`snapshots/`/`clips/` directories, writes a secrets template to
+`/etc/camera-alert.env`, and installs the three systemd units. Then:
+
+1. Edit `/etc/camera-alert.env` with your real Telegram bot token, chat ID,
+   and camera credentials.
+2. Edit `config.py`'s `CAMERAS` list with your camera IPs.
+3. `systemctl enable --now camera-listener camera-worker camera-bot`
+
+## Running manually (without systemd)
 
 ```bash
 CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... CAMERA_PASS=... python3 listener.py
 CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... python3 worker.py
 CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... python3 bot.py
-```
-
-Example systemd unit (repeat for `listener`, `worker`, `bot`):
-
-```ini
-[Unit]
-Description=Camera Alert Listener
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/camera-alert
-Environment="CAMERA_BOT_TOKEN=..."
-Environment="CAMERA_CHAT_ID=..."
-Environment="CAMERA_PASS=..."
-ExecStart=/usr/bin/python3 /opt/camera-alert/listener.py
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
 ```
 
 ## Telegram bot usage
