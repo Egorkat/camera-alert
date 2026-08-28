@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+# runtime data — never commit
+events.db
+*.log
+*.log.*
+filter.json
+muted
+
+# media captured by the system
+snapshots/
+clips/
