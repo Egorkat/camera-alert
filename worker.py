@@ -122,7 +122,9 @@ def run():
                         continue
 
                     if os.path.exists(config.MUTE_FILE):
-                        logging.info("muted, skipping event %s", eid)
+                        logging.info("muted, skipping event %s (not sent, will not retry)", eid)
+                        c.execute("UPDATE events SET sent=1 WHERE id=?", (eid,))
+                        conn.commit()
                         continue
 
                     if send_telegram(msg, snap):
