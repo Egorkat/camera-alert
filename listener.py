@@ -1,4 +1,5 @@
 import os
+import hashlib
 import requests
 from requests.auth import HTTPDigestAuth
 import sqlite3
@@ -98,6 +99,14 @@ def init_db():
         c.execute("ALTER TABLE events ADD COLUMN clip_path TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists on existing databases
+    try:
+        c.execute("ALTER TABLE events ADD COLUMN bbox TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists on existing databases
+    try:
+        c.execute("ALTER TABLE events ADD COLUMN recorded_clip_path TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists on existing databases
     conn.commit()
     conn.close()
 
@@ -139,8 +148,7 @@ def process_event(name, ip, user, pw, event_lines):
     json_str += "\n" + "\n".join(event_lines[idx + 1:])
 
     if code == "NewFile":
-        _handle_new_file(name, ip, user, pw, json_str)
-        return
+        return  # camera only ever pushes NewFile for .jpg snapshots, never .dav recordings
 
     # Capture snapshots/clips for all known supported event types; filter.json only
     # controls whether worker.py actually sends a Telegram notification for it.
@@ -172,6 +180,14 @@ def process_event(name, ip, user, pw, event_lines):
         threading.Timer(
             config.CLIP_FALLBACK_DELAY, _fallback_capture_if_needed,
             args=(event_id, name, code, ip, user, pw),
+        ).start()
+        # Started at once, in parallel with the live-capture fallback above: the camera
+        # never pushes a NewFile event for its own .dav recording, so we actively look
+        # one up on the SD card via JSON-RPC mediaFileFind instead of waiting for a push.
+        threading.Thread(
+            target=_fetch_recorded_clip,
+            args=(event_id, name, ip, user, pw, real_utc or now),
+            daemon=True,
         ).start()
 
 
@@ -237,16 +253,26 @@ def listen(cam):
                 backoff = min(backoff * 2, 60)
 
 
+def _day_dir(base_dir, ts):
+    """Per-day subfolder (DD-MM) so all of a day's media lives together."""
+    day_dir = os.path.join(base_dir, time.strftime("%d-%m", time.localtime(ts)))
+    is_new = not os.path.isdir(day_dir)
+    os.makedirs(day_dir, exist_ok=True)
+    if is_new:
+        # world-writable so the Samba "master" user can delete files here too (process runs as root)
+        os.chmod(day_dir, 0o777)
+    return day_dir
+
+
 def save_event(name, ip, event_type, raw, snapshot):
     snapshot_path = None
     if snapshot:
         try:
-            os.makedirs(config.SNAPSHOT_DIR, exist_ok=True)
             ts = int(time.time())
             _labels = {"VideoMotion": "motion", "SmartMotionHuman": "smart"}
             label = _labels.get(event_type, event_type.lower()[:8])
             fname = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(ts)) + f"_{name}_{label}.jpg"
-            snapshot_path = os.path.join(config.SNAPSHOT_DIR, fname)
+            snapshot_path = os.path.join(_day_dir(config.SNAPSHOT_DIR, ts), fname)
             with open(snapshot_path, "wb") as f:
                 f.write(snapshot)
         except Exception as e:
@@ -276,11 +302,11 @@ def save_event(name, ip, event_type, raw, snapshot):
 
 def _download_clip(event_id, name, code, ip, user, pw, real_utc):
     """Fallback: capture CLIP_SECONDS of live RTSP, used only if no NewFile clip arrives in time."""
-    os.makedirs(config.CLIP_DIR, exist_ok=True)
+    ts = int(time.time())
     _labels = {"VideoMotion": "motion", "SmartMotionHuman": "smart"}
     label = _labels.get(code, code.lower()[:8])
-    fname = time.strftime("%Y-%m-%d_%H-%M-%S") + f"_{name}_{label}.mp4"
-    clip_path = os.path.join(config.CLIP_DIR, fname)
+    fname = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(ts)) + f"_{name}_{label}.mp4"
+    clip_path = os.path.join(_day_dir(config.CLIP_DIR, ts), fname)
     url = f"rtsp://{user}:{pw}@{ip}:554/cam/realmonitor?channel=1&subtype=0"
 
     try:
@@ -308,24 +334,139 @@ def _fallback_capture_if_needed(event_id, name, code, ip, user, pw):
         _download_clip(event_id, name, code, ip, user, pw, None)
 
 
-def _handle_new_file(name, ip, user, pw, json_str):
-    """Camera pushes the exact recording path via NewFile; grab video files, skip jpg (snapshot already handled live)."""
+def _rpc_login(ip, user, pw):
+    """Dahua JSON-RPC 2-step challenge/response handshake; returns a session token."""
+    base = f"https://{ip}"
+    r1 = requests.post(f"{base}/RPC2_Login", json={
+        "method": "global.login",
+        "params": {"userName": user, "password": "", "clientType": "Web3.0"},
+        "id": 1,
+    }, timeout=10, verify=False).json()
+    realm, random_, session = r1["params"]["realm"], r1["params"]["random"], r1["session"]
+    h1 = hashlib.md5(f"{user}:{realm}:{pw}".encode()).hexdigest().upper()
+    h2 = hashlib.md5(f"{user}:{random_}:{h1}".encode()).hexdigest().upper()
+    r2 = requests.post(f"{base}/RPC2_Login", json={
+        "method": "global.login",
+        "params": {"userName": user, "password": h2, "clientType": "Web3.0"},
+        "id": 2, "session": session,
+    }, timeout=10, verify=False).json()
+    if not r2.get("result"):
+        raise RuntimeError(f"RPC login failed: {r2.get('error')}")
+    return r2["session"]
+
+
+# One JSON-RPC session is kept alive per camera and reused across events instead of
+# logging in/out each time — logging in for every event exhausted the camera's
+# concurrent-session limit during bursts ("too many connections!").
+_rpc_sessions = {}
+_rpc_sessions_lock = threading.Lock()
+_RPC_SESSION_INVALID = 287637504
+
+
+def _rpc_get_session(ip, user, pw):
+    # Hold the lock across the login call itself so a burst of near-simultaneous
+    # events for the same camera can't all miss the cache and log in at once.
+    with _rpc_sessions_lock:
+        session = _rpc_sessions.get(ip)
+        if session:
+            return session
+        session = _rpc_login(ip, user, pw)
+        _rpc_sessions[ip] = session
+        return session
+
+
+def _rpc_drop_session(ip):
+    with _rpc_sessions_lock:
+        _rpc_sessions.pop(ip, None)
+
+
+class _SessionExpired(Exception):
+    """Raised internally when the cached RPC session needs a fresh login."""
+
+
+def _rpc_call(ip, session, req_id, method, params=None, obj=None):
+    payload = {"method": method, "params": params, "id": req_id, "session": session}
+    if obj is not None:
+        payload["object"] = obj
+    return requests.post(f"https://{ip}/RPC2", json=payload, timeout=15, verify=False).json()
+
+
+def _find_recorded_file(ip, session, ts):
+    """Look up the SD-card .dav recording covering an event's timestamp via mediaFileFind.
+    Returns (path, is_open): Dahua keeps a trailing "_" on the filename while a segment is
+    still being written, and stripping it only happens once the recording is finalized —
+    downloading it before that produces a footer-less file ffmpeg can't remux."""
+    start = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts - 90))
+    end   = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts + 15))
+    when  = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    created = _rpc_call(ip, session, 1, "mediaFileFind.factory.create", {"channel": 0})
+    if created.get("error", {}).get("code") == _RPC_SESSION_INVALID:
+        raise _SessionExpired()
+    obj = created.get("result")
+    if not obj:
+        return None, False
     try:
-        data = json.loads(json_str.strip())
-    except Exception:
-        return
-    path = data.get("File")
-    if not path or not path.lower().endswith((".dav", ".mp4")):
-        return
-    threading.Thread(
-        target=_download_recorded_clip,
-        args=(name, ip, user, pw, path),
-        daemon=True,
-    ).start()
+        _rpc_call(ip, session, 2, "mediaFileFind.findFile", {"condition": {
+            "Channel": 0, "StartTime": start, "EndTime": end, "Types": ["dav"]}}, obj=obj)
+        res = _rpc_call(ip, session, 3, "mediaFileFind.findNextFile", {"count": 10}, obj=obj)
+        infos = (res.get("params") or {}).get("infos") or []
+        path = None
+        for info in infos:
+            if info.get("StartTime", "") <= when <= info.get("EndTime", ""):
+                path = info.get("FilePath")
+                break
+        else:
+            path = infos[0].get("FilePath") if infos else None
+        return path, bool(path and path.endswith("_"))
+    finally:
+        _rpc_call(ip, session, 4, "mediaFileFind.destroy", None, obj=obj)
 
 
-def _download_recorded_clip(name, ip, user, pw, path):
-    """Download the camera's own recorded file via RPC_Loadfile and remux to mp4."""
+# How long to wait before re-checking a recording that was still being written, and how
+# many times to retry before giving up on that event.
+_RECORDED_CLIP_RETRY_DELAYS = (20, 40, 40)
+
+
+def _fetch_recorded_clip(event_id, name, ip, user, pw, ts, attempt=0):
+    """Actively fetch the camera's own SD-card recording for this event via JSON-RPC —
+    the camera never pushes a NewFile event for .dav recordings, only for .jpg snapshots."""
+    for _ in range(2):
+        try:
+            session = _rpc_get_session(ip, user, pw)
+            path, is_open = _find_recorded_file(ip, session, ts)
+            break
+        except _SessionExpired:
+            _rpc_drop_session(ip)
+            continue
+        except Exception as e:
+            logging.warning("recorded clip lookup failed for event %s: %s", event_id, e)
+            return
+    else:
+        logging.warning("recorded clip lookup failed for event %s: session kept expiring", event_id)
+        return
+
+    # Not found yet (mediaFileFind can lag a couple seconds behind a just-started
+    # recording) and "still open" both mean "not ready" — retry the same way.
+    if not path or is_open:
+        if attempt < len(_RECORDED_CLIP_RETRY_DELAYS):
+            delay = _RECORDED_CLIP_RETRY_DELAYS[attempt]
+            reason = "still in progress" if path else "not indexed yet"
+            logging.info("recording for event %s %s, retrying in %ss", event_id, reason, delay)
+            threading.Timer(
+                delay, _fetch_recorded_clip,
+                args=(event_id, name, ip, user, pw, ts, attempt + 1),
+            ).start()
+        else:
+            logging.warning("no matching SD recording found for event %s after retries", event_id)
+        return
+
+    _download_recorded_clip(name, ip, user, pw, path, event_id)
+
+
+def _download_recorded_clip(name, ip, user, pw, path, event_id):
+    """Download the camera's own recorded file via RPC_Loadfile and store it as-is.
+    ffmpeg can't remux this camera's .dav variant (its dhav demuxer rejects the chunk
+    structure), but the raw file plays fine in MPC-HC/Dahua SmartPlayer, so skip conversion."""
     data = None
     for prefix in ("/cgi-bin/RPC_Loadfile", "/RPC_Loadfile"):
         try:
@@ -342,40 +483,23 @@ def _download_recorded_clip(name, ip, user, pw, path):
         logging.warning("recorded clip download failed for %s", path)
         return
 
-    os.makedirs(config.CLIP_DIR, exist_ok=True)
     ts = int(time.time())
-    fname = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(ts)) + f"_{name}_recorded.mp4"
-    clip_path = os.path.join(config.CLIP_DIR, fname)
-    tmp_dav = clip_path + ".dav.tmp"
+    fname = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(ts)) + f"_{name}_recorded.dav"
+    clip_path = os.path.join(_day_dir(config.CLIP_DIR, ts), fname)
     try:
-        with open(tmp_dav, "wb") as f:
+        with open(clip_path, "wb") as f:
             f.write(data)
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", tmp_dav, "-c", "copy", clip_path],
-            timeout=60, capture_output=True, check=True,
-        )
     except Exception as e:
-        logging.warning("recorded clip convert failed for %s: %s", path, e)
+        logging.warning("recorded clip save failed for %s: %s", path, e)
         return
-    finally:
-        try:
-            os.remove(tmp_dav)
-        except FileNotFoundError:
-            pass
 
+    # Keep both: this recorded-from-SD clip is stored alongside (not instead of) any
+    # live RTSP fallback clip already linked via clip_path.
     conn = sqlite3.connect(DB)
     try:
-        row = conn.execute(
-            "SELECT id FROM events WHERE camera=? AND clip_path IS NULL AND ts > ? "
-            "ORDER BY ts DESC LIMIT 1",
-            (name, ts - 120),
-        ).fetchone()
-        if row:
-            conn.execute("UPDATE events SET clip_path=? WHERE id=?", (clip_path, row[0]))
-            conn.commit()
-            logging.info("recorded clip saved and linked to event %s: %s", row[0], fname)
-        else:
-            logging.info("recorded clip saved (no matching event to link): %s", fname)
+        conn.execute("UPDATE events SET recorded_clip_path=? WHERE id=?", (clip_path, event_id))
+        conn.commit()
+        logging.info("recorded clip saved and linked to event %s: %s", event_id, fname)
     finally:
         conn.close()
 

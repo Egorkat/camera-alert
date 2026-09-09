@@ -6,7 +6,8 @@ with an interactive bot menu for status, mute, and filtering.
 
 ## How it works
 
-Three independent services, communicating through a shared SQLite database:
+Three independent services, communicating through a shared SQLite database and
+small flag files:
 
 ```
 listener.py  →  events.db  →  worker.py  →  Telegram
@@ -14,17 +15,18 @@ listener.py  →  events.db  →  worker.py  →  Telegram
      └── snapshots/, clips/            bot.py ─┘ (commands, menu, mute, filter)
 ```
 
-- **`listener.py`** — opens a persistent HTTP connection to each camera's
-  `eventManager.cgi` endpoint and streams motion/alarm events in real time.
-  On a supported event it grabs a live snapshot, stores the event in SQLite,
-  and captures a short video clip (preferring the camera's own recorded file
-  via the `NewFile` event + `RPC_Loadfile`, falling back to a live RTSP
-  capture if that doesn't arrive in time). Also runs a disk-space watchdog.
-- **`worker.py`** — polls the database for unsent events and delivers them to
-  Telegram, applying the active event-type filter and mute state.
+- **`listener.py`** — starts one persistent HTTPS event stream per camera,
+  captures snapshots, stores events in SQLite, and captures clips. It starts a
+  live RTSP fallback immediately and separately searches the camera SD card
+  for the matching `.dav` recording with `mediaFileFind` and `RPC_Loadfile`.
+  It also handles reconnects, disk-space monitoring, and a JSON health
+  endpoint.
+  Telegram, applying the active event-type filter and mute state. Events that
+  are filtered or muted are marked processed; only send failures are retried.
 - **`bot.py`** — Telegram bot with both text commands and an inline-button
   menu: live snapshots, recent event history, mute/unmute with reminders,
-  event-type filtering, and disk usage.
+  event-type filtering, disk usage, and daily status summaries. Muting also
+  disables camera email alerts.
 
 ## Requirements
 
@@ -55,8 +57,6 @@ CAMERAS = [
 ]
 ```
 
-## Running
-
 ## Installation
 
 ```bash
@@ -74,6 +74,9 @@ This installs system dependencies (`ffmpeg`, `python3-requests`), creates the
 2. Edit `config.py`'s `CAMERAS` list with your camera IPs.
 3. `systemctl enable --now camera-listener camera-worker camera-bot`
 
+The installation path must be `/opt/camera-alert` because the paths in
+`config.py` are absolute.
+
 ## Running manually (without systemd)
 
 ```bash
@@ -81,6 +84,22 @@ CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... CAMERA_PASS=... python3 listener.py
 CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... python3 worker.py
 CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... python3 bot.py
 ```
+
+## Storage and monitoring
+
+- `events.db` stores event metadata, snapshot paths, fallback clip paths, and
+  recorded camera clip paths.
+- `snapshots/DD-MM/` and `clips/DD-MM/` contain per-day media directories.
+- `filter.json` contains the active notification event codes. The listener
+  still records all codes in `ALL_EVENT_CODES`; the filter only controls
+  Telegram delivery.
+- A `muted` flag file silences worker delivery while the bot manages the mute
+  reminder and automatic unmute cycle.
+- `bot`, `listener`, and `worker` logs rotate daily and retain the configured
+  number of days.
+- The services expose JSON health endpoints on ports 8081, 8082, and 8083 by
+  default. Set the corresponding `HEALTH_PORT_*` value to `None` to disable
+  one.
 
 ## Telegram bot usage
 
@@ -97,7 +116,7 @@ directly:
 | `/mute` | Silence alerts (auto re-enables after a reminder cycle) |
 | `/keepmute` | Reset the mute reminder timer |
 | `/unmute` | Re-enable alerts |
-| `/filter` | Show/edit active event-type filter |
+| `/filter [add\|off\|reset] <code>` | Show/edit active event-type filter |
 | `/help` | Show command list |
 
 A daily status summary is sent automatically at the configured time
@@ -108,8 +127,14 @@ A daily status summary is sent automatically at the configured time
 - Snapshots and clips are captured for **every** supported event type
   regardless of the notification filter — the filter only controls whether
   a Telegram message is sent, not whether the event is recorded.
-- Fetching historical clips directly from camera SD-card storage
-  (`mediaFileFind`) proved unreliable across firmware versions and isn't
-  used; clips come from the `NewFile` push event or a live RTSP fallback.
+- The camera's `NewFile` event is reliable for `.jpg` snapshots but not for
+  `.dav` recordings. The listener therefore polls `mediaFileFind` narrowly for
+  the recording covering each event, while retaining the live RTSP capture as
+  a fallback. Downloaded `.dav`/dhav files are stored as-is because this
+  camera's variant cannot be remuxed reliably by `ffmpeg`.
+- JSON-RPC sessions are reused per camera to avoid exhausting the camera's
+  concurrent-session limit; expired sessions are recreated automatically.
+- Camera HTTP endpoints use digest authentication and disable TLS certificate
+  verification for trusted-LAN, self-signed camera certificates.
 - Health check endpoints (`HEALTH_PORT_*` in `config.py`) expose basic JSON
   status over HTTP for external monitoring; set to `None` to disable.
