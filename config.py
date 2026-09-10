@@ -4,7 +4,7 @@ BOT_TOKEN = os.environ["CAMERA_BOT_TOKEN"]
 CHAT_ID   = os.environ["CAMERA_CHAT_ID"]
 
 CAMERAS = [
-    {"name": "left",  "ip": "10.30.0.201"},
+    {"name": "left",  "ip": "10.30.0.201", "ftp_dir": "/opt/camera-alert/ftp/Dacha2"},
     {"name": "right", "ip": "10.30.0.202"},
     # Per-camera credentials are optional; falls back to CAMERA_USER/CAMERA_PASS:
     # {"name": "gate", "ip": "10.30.0.203", "user": "viewer", "pass": "secret"},
@@ -16,9 +16,12 @@ CAMERA_PASS = os.environ["CAMERA_PASS"]
 DB_PATH       = "/opt/camera-alert/events.db"
 SNAPSHOT_DIR  = "/opt/camera-alert/snapshots"
 CLIP_DIR      = "/opt/camera-alert/clips"
+FTP_DIR       = "/opt/camera-alert/ftp"
+FTP_MATCH_LEAD_SECONDS = 15  # allow camera event delivery to precede FTP recording start
 CLIP_SECONDS  = 15  # length of live RTSP capture recorded per motion event (fallback only)
 CLIP_FALLBACK_DELAY = 0  # NewFile clips never arrive in practice; start live capture immediately
-LOG_PATH      = "/opt/camera-alert/listener.log"
+LOG_DIR       = "/var/log/camera-alert"
+LOG_PATH      = f"{LOG_DIR}/listener.log"
 LOG_KEEP_DAYS = 14  # number of daily log files to keep
 MUTE_FILE     = "/opt/camera-alert/muted"  # presence of this file silences alerts
 FILTER_FILE   = "/opt/camera-alert/filter.json"  # JSON list of active event codes; absent = use EVENT_CODES

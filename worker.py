@@ -64,7 +64,7 @@ def send_telegram(text, image=None):
 
 def run():
     handler = logging.handlers.TimedRotatingFileHandler(
-        "/opt/camera-alert/worker.log", when="midnight",
+        f"{config.LOG_DIR}/worker.log", when="midnight",
         backupCount=config.LOG_KEEP_DAYS, encoding="utf-8",
     )
     handler.setFormatter(logging.Formatter(

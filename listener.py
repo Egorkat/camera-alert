@@ -1,5 +1,6 @@
 import os
 import hashlib
+import re
 import requests
 from requests.auth import HTTPDigestAuth
 import sqlite3
@@ -126,7 +127,7 @@ def fetch_snapshot(ip, user, pw, real_utc=None):
         return None
 
 
-def process_event(name, ip, user, pw, event_lines):
+def process_event(name, ip, user, pw, event_lines, ftp_dir=None):
     code_line = next((l for l in event_lines if l.startswith("Code=")), None)
     if not code_line:
         return
@@ -177,18 +178,24 @@ def process_event(name, ip, user, pw, event_lines):
     event_id = save_event(name, ip, code, "\n".join(event_lines), snapshot)
 
     if event_id:
-        threading.Timer(
-            config.CLIP_FALLBACK_DELAY, _fallback_capture_if_needed,
-            args=(event_id, name, code, ip, user, pw),
-        ).start()
-        # Started at once, in parallel with the live-capture fallback above: the camera
-        # never pushes a NewFile event for its own .dav recording, so we actively look
-        # one up on the SD card via JSON-RPC mediaFileFind instead of waiting for a push.
-        threading.Thread(
-            target=_fetch_recorded_clip,
-            args=(event_id, name, ip, user, pw, real_utc or now),
-            daemon=True,
-        ).start()
+        if ftp_dir:
+            threading.Thread(
+                target=_link_ftp_recording,
+                args=(event_id, ftp_dir, real_utc or now),
+                daemon=True,
+            ).start()
+        else:
+            threading.Timer(
+                config.CLIP_FALLBACK_DELAY, _fallback_capture_if_needed,
+                args=(event_id, name, code, ip, user, pw),
+            ).start()
+            # The camera does not push a NewFile event for its own .dav recordings,
+            # so look up the matching SD-card file through JSON-RPC.
+            threading.Thread(
+                target=_fetch_recorded_clip,
+                args=(event_id, name, ip, user, pw, real_utc or now),
+                daemon=True,
+            ).start()
 
 
 def listen(cam):
@@ -234,7 +241,7 @@ def listen(cam):
 
                     if line == "--myboundary":
                         if event_buf:
-                            process_event(name, ip, user, pw, event_buf)
+                            process_event(name, ip, user, pw, event_buf, cam.get("ftp_dir"))
                         event_buf = []
                     else:
                         event_buf.append(line)
@@ -332,6 +339,95 @@ def _fallback_capture_if_needed(event_id, name, code, ip, user, pw):
     if row and row[0] is None:
         logging.info("no recorded clip for event %s yet, falling back to live capture", event_id)
         _download_clip(event_id, name, code, ip, user, pw, None)
+
+
+_FTP_RETRY_DELAYS = (10, 20, 40, 40)
+_FTP_TIME_RE = re.compile(
+    r"^(\d{2})\.(\d{2})\.(\d{2})-(\d{2})\.(\d{2})\.(\d{2}).*\.dav$",
+    re.IGNORECASE,
+)
+
+
+def _ftp_recording_interval(filename):
+    match = _FTP_TIME_RE.match(filename)
+    if not match:
+        return None
+    values = [int(value) for value in match.groups()]
+    start = values[0] * 3600 + values[1] * 60 + values[2]
+    end = values[3] * 3600 + values[4] * 60 + values[5]
+    if end < start:
+        end += 24 * 3600
+    return start, end
+
+
+def _find_ftp_recording(ftp_dir, ts):
+    day = time.strftime("%Y-%m-%d", time.localtime(ts))
+    day_dir = os.path.join(ftp_dir, day)
+    if not os.path.isdir(day_dir):
+        return None
+
+    local_time = time.localtime(ts)
+    event_second = local_time.tm_hour * 3600 + local_time.tm_min * 60 + local_time.tm_sec
+    candidates = []
+    for root, _, files in os.walk(day_dir):
+        for filename in files:
+            interval = _ftp_recording_interval(filename)
+            if not interval:
+                continue
+            start, end = interval
+            if start - config.FTP_MATCH_LEAD_SECONDS <= event_second <= end:
+                contains_event = start <= event_second <= end
+                distance = 0 if contains_event else min(
+                    abs(event_second - start), abs(event_second - end)
+                )
+                candidates.append((not contains_event, distance, os.path.join(root, filename)))
+
+    for _, _, path in sorted(candidates):
+        index_path = os.path.splitext(path)[0] + ".idx"
+        if not os.path.exists(index_path):
+            continue
+        try:
+            size = os.path.getsize(path)
+            if size <= 0:
+                continue
+            time.sleep(1)
+            if os.path.getsize(path) != size:
+                continue
+        except OSError:
+            continue
+        return path
+    return None
+
+
+def _link_ftp_recording(event_id, ftp_dir, ts, attempt=0):
+    try:
+        path = _find_ftp_recording(ftp_dir, ts)
+    except Exception as e:
+        logging.warning("FTP recording lookup failed for event %s: %s", event_id, e)
+        path = None
+
+    if path:
+        conn = sqlite3.connect(DB)
+        try:
+            conn.execute(
+                "UPDATE events SET recorded_clip_path=? WHERE id=? AND recorded_clip_path IS NULL",
+                (path, event_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        logging.info("FTP recording linked to event %s: %s", event_id, path)
+        return
+
+    if attempt < len(_FTP_RETRY_DELAYS):
+        delay = _FTP_RETRY_DELAYS[attempt]
+        logging.info("FTP recording for event %s not ready, retrying in %ss", event_id, delay)
+        threading.Timer(
+            delay, _link_ftp_recording,
+            args=(event_id, ftp_dir, ts, attempt + 1),
+        ).start()
+    else:
+        logging.warning("no FTP recording found for event %s after retries", event_id)
 
 
 def _rpc_login(ip, user, pw):

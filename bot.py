@@ -523,7 +523,7 @@ def _daily_status_scheduler():
 
 def main():
     handler = logging.handlers.TimedRotatingFileHandler(
-        "/opt/camera-alert/bot.log", when="midnight",
+        f"{config.LOG_DIR}/bot.log", when="midnight",
         backupCount=config.LOG_KEEP_DAYS, encoding="utf-8",
     )
     handler.setFormatter(logging.Formatter(
