@@ -74,6 +74,8 @@ def _mark_day_processed(source_path, status="processed"):
     day = _day_key(source_path)
     if not day:
         return
+    if day >= time.strftime("%Y-%m-%d"):
+        return  # never mark today (or later) as done — more clips can still arrive before midnight
     conn = sqlite3.connect(config.DB_PATH)
     try:
         conn.execute(

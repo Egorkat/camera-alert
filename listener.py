@@ -177,16 +177,18 @@ def process_event(name, ip, user, pw, event_lines):
     event_id = save_event(name, ip, code, "\n".join(event_lines), snapshot)
 
     if event_id:
-        threading.Timer(
-            config.CLIP_FALLBACK_DELAY, _fallback_capture_if_needed,
+        _prepare_live_capture(event_id)
+        threading.Thread(
+            target=_capture_live_clip_memory,
             args=(event_id, name, code, ip, user, pw),
+            daemon=True,
         ).start()
         # Started at once, in parallel with the live-capture fallback above: the camera
         # never pushes a NewFile event for its own .dav recording, so we actively look
         # one up on the SD card via JSON-RPC mediaFileFind instead of waiting for a push.
         threading.Thread(
             target=_fetch_recorded_clip,
-            args=(event_id, name, ip, user, pw, real_utc or now),
+            args=(event_id, name, code, ip, user, pw, real_utc or now),
             daemon=True,
         ).start()
 
@@ -300,40 +302,6 @@ def save_event(name, ip, event_type, raw, snapshot):
     return c.lastrowid
 
 
-def _download_clip(event_id, name, code, ip, user, pw, real_utc):
-    """Fallback: capture CLIP_SECONDS of live RTSP, used only if no NewFile clip arrives in time."""
-    ts = int(time.time())
-    _labels = {"VideoMotion": "motion", "SmartMotionHuman": "smart"}
-    label = _labels.get(code, code.lower()[:8])
-    fname = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(ts)) + f"_{name}_{label}.mp4"
-    clip_path = os.path.join(_day_dir(config.CLIP_DIR, ts), fname)
-    url = f"rtsp://{user}:{pw}@{ip}:554/cam/realmonitor?channel=1&subtype=0"
-
-    try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-rtsp_transport", "tcp", "-i", url,
-             "-t", str(config.CLIP_SECONDS), "-c:v", "copy", "-c:a", "aac", clip_path],
-            timeout=config.CLIP_SECONDS + 30, capture_output=True, check=True,
-        )
-        logging.info("fallback clip saved: %s", fname)
-        conn = sqlite3.connect(DB)
-        conn.execute("UPDATE events SET clip_path=? WHERE id=? AND clip_path IS NULL", (clip_path, event_id))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logging.warning("fallback clip capture failed for event %s: %s", event_id, e)
-
-
-def _fallback_capture_if_needed(event_id, name, code, ip, user, pw):
-    """Run the live-capture fallback only if no NewFile-sourced clip has arrived yet."""
-    conn = sqlite3.connect(DB)
-    row = conn.execute("SELECT clip_path FROM events WHERE id=?", (event_id,)).fetchone()
-    conn.close()
-    if row and row[0] is None:
-        logging.info("no recorded clip for event %s yet, falling back to live capture", event_id)
-        _download_clip(event_id, name, code, ip, user, pw, None)
-
-
 def _rpc_login(ip, user, pw):
     """Dahua JSON-RPC 2-step challenge/response handshake; returns a session token."""
     base = f"https://{ip}"
@@ -392,7 +360,10 @@ def _rpc_call(ip, session, req_id, method, params=None, obj=None):
 
 
 def _find_recorded_file(ip, session, ts):
-    """Look up the SD-card .dav recording covering an event's timestamp via mediaFileFind.
+    """Look up the recording covering an event's timestamp via mediaFileFind. Both cameras are
+    configured to record to FTP normally and only fall back to the SD card if the FTP upload
+    fails, so FilePath is almost always an ftp:// URL (handled separately by converter.py) and
+    only a bare local path is actually fetchable here.
     Returns (path, is_open): Dahua keeps a trailing "_" on the filename while a segment is
     still being written, and stripping it only happens once the recording is finalized —
     downloading it before that produces a footer-less file ffmpeg can't remux."""
@@ -422,14 +393,100 @@ def _find_recorded_file(ip, session, ts):
         _rpc_call(ip, session, 4, "mediaFileFind.destroy", None, obj=obj)
 
 
-# How long to wait before re-checking a recording that was still being written, and how
-# many times to retry before giving up on that event.
-_RECORDED_CLIP_RETRY_DELAYS = (20, 40, 40)
+# Keep the short live capture available while the camera finishes writing and indexing
+# its own recording. It is only saved if no usable DAV arrives before this deadline.
+# Both cameras only record to the SD card "for emergency" (Local=false, LocalForEmergency=true
+# in RecordStoragePoint) — under normal operation mediaFileFind only ever returns the ftp://
+# path that converter.py already handles, so this window just needs to cover indexing lag for
+# a genuine local recording, not the old (much slower) FTP-indexing case.
+_RECORDED_CLIP_MAX_WAIT = 90
+_RECORDED_CLIP_RETRY_DELAY = 15
+_pending_live_captures = {}
+_pending_live_captures_lock = threading.Lock()
 
 
-def _fetch_recorded_clip(event_id, name, ip, user, pw, ts, attempt=0):
-    """Actively fetch the camera's own SD-card recording for this event via JSON-RPC —
-    the camera never pushes a NewFile event for .dav recordings, only for .jpg snapshots."""
+def _prepare_live_capture(event_id):
+    with _pending_live_captures_lock:
+        _pending_live_captures[event_id] = {"ready": threading.Event(), "data": None}
+
+
+def _capture_live_clip_memory(event_id, name, code, ip, user, pw):
+    with _pending_live_captures_lock:
+        slot = _pending_live_captures.get(event_id)
+    if not slot:
+        return
+
+    url = f"rtsp://{user}:{pw}@{ip}:554/cam/realmonitor?channel=1&subtype=0"
+    command = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-rtsp_transport", "tcp", "-i", url,
+        "-t", str(config.CLIP_SECONDS),
+        "-map", "0:v:0", "-map", "0:a?",
+        "-c:v", "copy", "-c:a", "aac",
+        "-movflags", "+frag_keyframe+empty_moov",
+        "-f", "mp4", "pipe:1",
+    ]
+    try:
+        result = subprocess.run(
+            command, timeout=config.CLIP_SECONDS + 30,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+        )
+        if result.stdout:
+            slot["data"] = result.stdout
+            logging.info("captured %d-second live fallback in memory for event %s", config.CLIP_SECONDS, event_id)
+        else:
+            logging.warning("live fallback produced no data for event %s", event_id)
+    except Exception as exc:
+        logging.warning("live fallback capture failed for event %s: %s", event_id, exc)
+    finally:
+        slot["ready"].set()
+
+
+def _discard_live_capture(event_id):
+    with _pending_live_captures_lock:
+        _pending_live_captures.pop(event_id, None)
+
+
+def _save_live_capture(event_id, name, code):
+    with _pending_live_captures_lock:
+        slot = _pending_live_captures.get(event_id)
+    if not slot:
+        return False
+
+    slot["ready"].wait(timeout=config.CLIP_SECONDS + 30)
+    data = slot.get("data")
+    if not data:
+        _discard_live_capture(event_id)
+        return False
+
+    ts = int(time.time())
+    label = {"VideoMotion": "motion", "SmartMotionHuman": "smart"}.get(code, code.lower()[:8])
+    fname = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(ts)) + f"_{name}_{label}.mp4"
+    clip_path = os.path.join(_day_dir(config.CLIP_DIR, ts), fname)
+    try:
+        with open(clip_path, "wb") as clip_file:
+            clip_file.write(data)
+        os.chmod(clip_path, 0o666)
+        conn = sqlite3.connect(DB)
+        conn.execute("UPDATE events SET clip_path=? WHERE id=? AND clip_path IS NULL", (clip_path, event_id))
+        conn.commit()
+        conn.close()
+        logging.warning("saved live fallback for event %s after no DAV arrived: %s", event_id, clip_path)
+        return True
+    except Exception as exc:
+        logging.warning("live fallback save failed for event %s: %s", event_id, exc)
+        return False
+    finally:
+        _discard_live_capture(event_id)
+
+
+def _fetch_recorded_clip(event_id, name, code, ip, user, pw, ts, started=None):
+    """Actively fetch the camera's own local SD recording for this event via JSON-RPC, used
+    only when the camera's normal FTP upload has failed — the camera never pushes a NewFile
+    event for .dav recordings, only for .jpg snapshots."""
+    if started is None:
+        started = time.monotonic()
+
     for _ in range(2):
         try:
             session = _rpc_get_session(ip, user, pw)
@@ -440,27 +497,51 @@ def _fetch_recorded_clip(event_id, name, ip, user, pw, ts, attempt=0):
             continue
         except Exception as e:
             logging.warning("recorded clip lookup failed for event %s: %s", event_id, e)
-            return
+            path, is_open = None, False
     else:
         logging.warning("recorded clip lookup failed for event %s: session kept expiring", event_id)
+        if time.monotonic() - started < _RECORDED_CLIP_MAX_WAIT:
+            threading.Timer(
+                _RECORDED_CLIP_RETRY_DELAY, _fetch_recorded_clip,
+                args=(event_id, name, code, ip, user, pw, ts, started),
+            ).start()
+        else:
+            _save_live_capture(event_id, name, code)
+        return
+
+    # An ftp:// path means the recording went to FTP as usual (converter.py already handles
+    # it there); the camera only writes locally when FTP upload fails, so there is no local
+    # emergency copy to wait for here — stop immediately instead of polling for the full window.
+    if path and path.startswith("ftp://"):
+        logging.info("event %s recorded via FTP only (no local emergency copy), skipping RPC fetch", event_id)
+        _save_live_capture(event_id, name, code)
         return
 
     # Not found yet (mediaFileFind can lag a couple seconds behind a just-started
     # recording) and "still open" both mean "not ready" — retry the same way.
     if not path or is_open:
-        if attempt < len(_RECORDED_CLIP_RETRY_DELAYS):
-            delay = _RECORDED_CLIP_RETRY_DELAYS[attempt]
+        if time.monotonic() - started < _RECORDED_CLIP_MAX_WAIT:
             reason = "still in progress" if path else "not indexed yet"
-            logging.info("recording for event %s %s, retrying in %ss", event_id, reason, delay)
+            logging.info("recording for event %s %s, retrying in %ss", event_id, reason, _RECORDED_CLIP_RETRY_DELAY)
             threading.Timer(
-                delay, _fetch_recorded_clip,
-                args=(event_id, name, ip, user, pw, ts, attempt + 1),
+                _RECORDED_CLIP_RETRY_DELAY, _fetch_recorded_clip,
+                args=(event_id, name, code, ip, user, pw, ts, started),
             ).start()
         else:
-            logging.warning("no matching SD recording found for event %s after retries", event_id)
+            logging.warning("no matching SD recording found for event %s after %ss", event_id, _RECORDED_CLIP_MAX_WAIT)
+            _save_live_capture(event_id, name, code)
         return
 
-    _download_recorded_clip(name, ip, user, pw, path, event_id)
+    if _download_recorded_clip(name, ip, user, pw, path, event_id):
+        _discard_live_capture(event_id)
+    elif time.monotonic() - started < _RECORDED_CLIP_MAX_WAIT:
+        logging.info("recording for event %s found but download failed, retrying in %ss", event_id, _RECORDED_CLIP_RETRY_DELAY)
+        threading.Timer(
+            _RECORDED_CLIP_RETRY_DELAY, _fetch_recorded_clip,
+            args=(event_id, name, code, ip, user, pw, ts, started),
+        ).start()
+    else:
+        _save_live_capture(event_id, name, code)
 
 
 def _download_recorded_clip(name, ip, user, pw, path, event_id):
@@ -481,7 +562,7 @@ def _download_recorded_clip(name, ip, user, pw, path, event_id):
             logging.debug("RPC_Loadfile via %s failed: %s", prefix, e)
     if data is None:
         logging.warning("recorded clip download failed for %s", path)
-        return
+        return False
 
     ts = int(time.time())
     fname = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(ts)) + f"_{name}_recorded.dav"
@@ -491,10 +572,9 @@ def _download_recorded_clip(name, ip, user, pw, path, event_id):
             f.write(data)
     except Exception as e:
         logging.warning("recorded clip save failed for %s: %s", path, e)
-        return
+        return False
 
-    # Keep both: this recorded-from-SD clip is stored alongside (not instead of) any
-    # live RTSP fallback clip already linked via clip_path.
+    # The in-memory live fallback is discarded after this recorded clip is linked.
     conn = sqlite3.connect(DB)
     try:
         conn.execute("UPDATE events SET recorded_clip_path=? WHERE id=?", (clip_path, event_id))
@@ -502,6 +582,7 @@ def _download_recorded_clip(name, ip, user, pw, path, event_id):
         logging.info("recorded clip saved and linked to event %s: %s", event_id, fname)
     finally:
         conn.close()
+    return True
 
 
 def main():
