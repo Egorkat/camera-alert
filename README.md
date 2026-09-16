@@ -6,33 +6,43 @@ with an interactive bot menu for status, mute, and filtering.
 
 ## How it works
 
-Three independent services, communicating through a shared SQLite database and
-small flag files:
+Four application services plus the FTP upload service communicate through a
+shared SQLite database and small flag files:
 
 ```
 listener.py  →  events.db  →  worker.py  →  Telegram
      │                                         ▲
-     └── snapshots/, clips/            bot.py ─┘ (commands, menu, mute, filter)
+  ├── snapshots/, clips           bot.py ─┘ (commands, menu, mute, filter)
+  └── FTP .dav files → converter.py → clips/DD-MM/*.mp4
 ```
 
 - **`listener.py`** — starts one persistent HTTPS event stream per camera,
-  captures snapshots, stores events in SQLite, and captures clips. The `left`
-  camera links its complete FTP-uploaded `.dav` recording to the event; other
-  cameras use the live RTSP fallback and the camera SD-card lookup through
-  `mediaFileFind` and `RPC_Loadfile`.
+  captures snapshots, stores events in SQLite, and captures clips. For each
+  event it looks up the camera's own SD-card `.dav` recording through
+  `mediaFileFind` and `RPC_Loadfile`, while also using a live RTSP capture as a
+  fallback. FTP-uploaded `.dav` files are processed independently by
+  `converter.py` and are not linked to events by the listener.
   It also handles reconnects, disk-space monitoring, and a JSON health
   endpoint.
-  Telegram, applying the active event-type filter and mute state. Events that
+- **`worker.py`** — polls unsent events and sends Telegram alerts with optional
+  snapshots, applying the active event-type filter and mute state. Events that
   are filtered or muted are marked processed; only send failures are retried.
 - **`bot.py`** — Telegram bot with both text commands and an inline-button
   menu: live snapshots, recent event history, mute/unmute with reminders,
   event-type filtering, disk usage, and daily status summaries. Muting also
   disables camera email alerts.
+- **`converter.py`** — scans completed FTP `.dav` files oldest-first, converts
+  the first six seconds to smaller H.264/AAC MP4 files at up to 1280 pixels
+  wide, and stores them in `clips/DD-MM/`. Conversion state is tracked in
+  SQLite; failures generate Telegram warnings, and manually deleted outputs
+  are recorded so they are not regenerated indefinitely.
+- **`camera-ftp.service`** — accepts camera FTP uploads into `ftp/`; it is
+  separate from the four Python application services.
 
 ## Requirements
 
 - Python 3 with `requests`
-- `ffmpeg` (for clip remuxing/fallback capture)
+- `ffmpeg` (for MP4 conversion and live RTSP fallback capture)
 - One or more Dahua/Dahua-OEM cameras with HTTP API access enabled
 - A Telegram bot token ([@BotFather](https://t.me/BotFather)) and your chat ID
 
@@ -68,9 +78,9 @@ sudo ./install.sh
 
 This installs system dependencies (`ffmpeg`, `python3-requests`, and
 `vsftpd`), creates the `snapshots/`, `clips/`, and `ftp/` directories, writes a
-secrets template to `/etc/camera-alert.env`, and installs the four systemd
-units. The FTP server listens on port 21 and accepts uploads into
-`/opt/camera-alert/ftp` using a dedicated local account. Then:
+secrets template to `/etc/camera-alert.env`, and installs four Python systemd
+units plus the FTP systemd unit. The FTP server listens on port 21 and accepts
+uploads into `/opt/camera-alert/ftp` using a dedicated local account. Then:
 
 1. Edit `/etc/camera-alert.env` with your real Telegram bot token, chat ID,
    camera credentials, and FTP credentials if needed.
@@ -78,7 +88,7 @@ units. The FTP server listens on port 21 and accepts uploads into
 3. Configure one camera's FTP destination as this host's LAN IP, port `21`,
    the `CAMERA_FTP_USER`/`CAMERA_FTP_PASS` credentials, and remote directory
    `/` (the account is chrooted to the FTP drop directory).
-4. `systemctl enable --now camera-listener camera-worker camera-bot`
+4. `systemctl enable --now camera-listener camera-worker camera-bot camera-converter`
 
 The installation path must be `/opt/camera-alert` because the paths in
 `config.py` are absolute.
@@ -89,14 +99,17 @@ The installation path must be `/opt/camera-alert` because the paths in
 CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... CAMERA_PASS=... python3 listener.py
 CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... python3 worker.py
 CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... python3 bot.py
+CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... CAMERA_PASS=... python3 converter.py
 ```
 
 ## Storage and monitoring
 
-- `events.db` stores event metadata, snapshot paths, fallback clip paths, and
-  recorded camera clip paths. For `left`, the recorded path points into the FTP
-  upload tree after the `.dav` and matching `.idx` files are complete.
-- `snapshots/DD-MM/` and `clips/DD-MM/` contain per-day media directories.
+- `events.db` stores event metadata, snapshot paths, fallback clip paths,
+  recorded camera clip paths, and conversion status/output paths. For `left`,
+  the recorded path points into the FTP upload tree after the `.dav` and
+  matching `.idx` files are complete.
+- `snapshots/DD-MM/` contains snapshots; `clips/DD-MM/` contains live fallback
+  clips and the converter's six-second MP4 review clips.
 - `ftp/` is the FTP upload drop directory, exposed as `/` to the dedicated FTP
   account and writable for Samba access. FTP transfer logs are written to
   `/var/log/camera-alert/ftp.log`.
@@ -138,13 +151,36 @@ A daily status summary is sent automatically at the configured time
   regardless of the notification filter — the filter only controls whether
   a Telegram message is sent, not whether the event is recorded.
 - The camera's `NewFile` event is reliable for `.jpg` snapshots but not for
-  `.dav` recordings. The `left` camera uploads recordings to FTP; the listener
-  matches the filename time interval to the event, waits for a stable file and
-  its `.idx` companion, then links the existing FTP path. Other cameras use
-  the narrower `mediaFileFind` lookup and live RTSP fallback.
+  `.dav` recordings. The listener uses `mediaFileFind` and `RPC_Loadfile` to
+  download the camera's SD-card recording, with live RTSP capture as a
+  fallback. FTP-uploaded `.dav` files are handled separately by the converter.
+- The converter processes FTP recordings oldest-first and processes each source
+  day once. It records conversion status in SQLite, sends a Telegram warning
+  for a failed conversion, and records manually deleted outputs so old clips
+  are not regenerated indefinitely. Failed conversions are not silently
+  retried forever.
 - JSON-RPC sessions are reused per camera to avoid exhausting the camera's
   concurrent-session limit; expired sessions are recreated automatically.
 - Camera HTTP endpoints use digest authentication and disable TLS certificate
   verification for trusted-LAN, self-signed camera certificates.
 - Health check endpoints (`HEALTH_PORT_*` in `config.py`) expose basic JSON
   status over HTTP for external monitoring; set to `None` to disable.
+
+## Verified camera configuration
+
+The Dahua JSON-RPC challenge/response login has been verified against both
+configured cameras using the same credentials loaded by systemd from
+`/etc/camera-alert.env`. The configuration tables exposed by this firmware are:
+
+- `MotionDetect` — ordinary motion detection settings
+- `VideoAnalyseRule` — IVS analytics rules, including cross-line and
+  cross-region detection
+
+The two cameras currently match for `MotionDetect`: enabled state, sensitivity
+(`60`), threshold (`5`), full-frame region, 24/7 schedule, recording,
+snapshots, and alarm-output actions.
+
+Their `VideoAnalyseRule` settings are not identical. The cross-line geometry is
+different, and the first analytics rule has mail notifications disabled on
+`10.30.0.201` but enabled on `10.30.0.202`. No camera settings are changed by
+the checker; [check_camera_rpc.py](check_camera_rpc.py) only reads them.

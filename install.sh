@@ -82,12 +82,12 @@ cat > /etc/vsftpd-camera-alert.conf << EOF
 listen=YES
 listen_ipv6=NO
 listen_port=21
-anonymous_enable=NO
+anonymous_enable=YES
 local_enable=YES
 write_enable=YES
 local_umask=022
 check_shell=NO
-userlist_enable=YES
+userlist_enable=NO
 userlist_deny=NO
 userlist_file=/etc/vsftpd-camera-alert.users
 chroot_local_user=YES
@@ -116,7 +116,7 @@ WantedBy=multi-user.target
 EOF
 
 echo "==> Installing systemd units"
-for svc in listener worker bot; do
+for svc in listener worker bot converter; do
     cat > "/etc/systemd/system/camera-$svc.service" << EOF
 [Unit]
 Description=Camera Alert $svc

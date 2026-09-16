@@ -5,7 +5,7 @@ CHAT_ID   = os.environ["CAMERA_CHAT_ID"]
 
 CAMERAS = [
     {"name": "left",  "ip": "10.30.0.201", "ftp_dir": "/opt/camera-alert/ftp/Dacha2"},
-    {"name": "right", "ip": "10.30.0.202"},
+    {"name": "right", "ip": "10.30.0.202", "ftp_dir": "/opt/camera-alert/ftp/Dacha1"},
     # Per-camera credentials are optional; falls back to CAMERA_USER/CAMERA_PASS:
     # {"name": "gate", "ip": "10.30.0.203", "user": "viewer", "pass": "secret"},
 ]
@@ -17,6 +17,11 @@ DB_PATH       = "/opt/camera-alert/events.db"
 SNAPSHOT_DIR  = "/opt/camera-alert/snapshots"
 CLIP_DIR      = "/opt/camera-alert/clips"
 FTP_DIR       = "/opt/camera-alert/ftp"
+CONVERTER_INTERVAL = 15  # seconds between scans for completed DAV uploads
+CONVERTER_WIDTH = 1280  # output width; height is preserved
+CONVERTER_DURATION = 6  # motion alert clips only need the opening seconds
+CONVERTER_CRF = 28  # smaller files while retaining useful review quality
+CONVERTER_PRESET = "veryfast"
 FTP_MATCH_LEAD_SECONDS = 15  # allow camera event delivery to precede FTP recording start
 CLIP_SECONDS  = 15  # length of live RTSP capture recorded per motion event (fallback only)
 CLIP_FALLBACK_DELAY = 0  # NewFile clips never arrive in practice; start live capture immediately
