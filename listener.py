@@ -510,11 +510,11 @@ def _fetch_recorded_clip(event_id, name, code, ip, user, pw, ts, started=None):
         return
 
     # An ftp:// path means the recording went to FTP as usual (converter.py already handles
-    # it there); the camera only writes locally when FTP upload fails, so there is no local
-    # emergency copy to wait for here — stop immediately instead of polling for the full window.
+    # it there and will produce the real clip); the camera only writes locally when FTP upload
+    # fails, so there is no local emergency copy to wait for and no need to keep the fallback.
     if path and path.startswith("ftp://"):
-        logging.info("event %s recorded via FTP only (no local emergency copy), skipping RPC fetch", event_id)
-        _save_live_capture(event_id, name, code)
+        logging.info("event %s recorded via FTP only (no local emergency copy), discarding live fallback", event_id)
+        _discard_live_capture(event_id)
         return
 
     # Not found yet (mediaFileFind can lag a couple seconds behind a just-started
