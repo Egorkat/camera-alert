@@ -8,6 +8,7 @@ import logging.handlers
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import config
+from tools.feedback import learning_enabled
 
 
 def _start_health(port, get_status):
@@ -34,23 +35,46 @@ def active_filter():
         return set(config.EVENT_CODES)
 
 
-def send_telegram(text, image=None):
+def event_allowed(event_type):
+    """Allow all events while learning is enabled so feedback can tune thresholds."""
+    if learning_enabled():
+        return True
+    return event_type in active_filter()
+
+
+def _feedback_keyboard(event_id):
+    return [[
+        {"text": "✅ Human", "callback_data": f"feedback:{event_id}:human"},
+        {"text": "🐾 Animal", "callback_data": f"feedback:{event_id}:animal"},
+        {"text": "🚫 Noise", "callback_data": f"feedback:{event_id}:noise"},
+    ]]
+
+
+def send_telegram(text, image=None, keyboard=None):
     try:
         if image:
             logging.info("sending photo to Telegram")
             url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendPhoto"
+            payload = {
+                "chat_id": config.CHAT_ID,
+                "caption": text,
+                "reply_markup": json.dumps({"inline_keyboard": keyboard or []}) if keyboard else None,
+            }
             r = requests.post(
                 url,
-                data={"chat_id": config.CHAT_ID, "caption": text},
+                data=payload,
                 files={"photo": image},
                 timeout=30,
             )
         else:
             logging.info("sending message to Telegram")
             url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage"
+            payload = {"chat_id": config.CHAT_ID, "text": text}
+            if keyboard:
+                payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
             r = requests.post(
                 url,
-                data={"chat_id": config.CHAT_ID, "text": text},
+                data=payload,
                 timeout=15,
             )
         logging.debug("Telegram %s %s", r.status_code, r.text[:100])
@@ -115,7 +139,7 @@ def run():
                         except Exception as e:
                             logging.warning("could not read snapshot %s: %s", snap_path, e)
 
-                    if etype not in active_filter():
+                    if not event_allowed(etype):
                         logging.info("filtered %s, skipping event %s", etype, eid)
                         c.execute("UPDATE events SET sent=1 WHERE id=?", (eid,))
                         conn.commit()
@@ -127,7 +151,8 @@ def run():
                         conn.commit()
                         continue
 
-                    if send_telegram(msg, snap):
+                    keyboard = _feedback_keyboard(eid) if learning_enabled() else None
+                    if send_telegram(msg, snap, keyboard):
                         c.execute("UPDATE events SET sent=1 WHERE id=?", (eid,))
                         conn.commit()
                         logging.info("sent event %s", eid)

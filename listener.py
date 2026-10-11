@@ -1,5 +1,6 @@
 import os
 import hashlib
+import re
 import requests
 from requests.auth import HTTPDigestAuth
 import sqlite3
@@ -13,6 +14,9 @@ import shutil
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import config
 from urllib3.exceptions import InsecureRequestWarning
+
+from tools.feedback import learning_enabled, should_accept_snapshot
+from tools.snapshot_probe import score_snapshot
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
@@ -266,20 +270,45 @@ def _day_dir(base_dir, ts):
     return day_dir
 
 
+def _snapshot_is_likely_target(snapshot_bytes, camera_name):
+    if not snapshot_bytes:
+        return False
+    if learning_enabled():
+        return True
+    try:
+        result = score_snapshot(snapshot_bytes)
+        score = float(result.get("score", 0.0))
+        if result.get("likely_human_or_animal"):
+            return should_accept_snapshot(camera_name, score)
+        return False
+    except Exception as exc:
+        logging.warning("snapshot scoring failed: %s", exc)
+        return False
+
+
 def save_event(name, ip, event_type, raw, snapshot):
     snapshot_path = None
     if snapshot:
         try:
-            ts = int(time.time())
-            _labels = {"VideoMotion": "motion", "SmartMotionHuman": "smart"}
-            label = _labels.get(event_type, event_type.lower()[:8])
-            fname = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(ts)) + f"_{name}_{label}.jpg"
-            snapshot_path = os.path.join(_day_dir(config.SNAPSHOT_DIR, ts), fname)
-            with open(snapshot_path, "wb") as f:
-                f.write(snapshot)
-        except Exception as e:
-            logging.warning("snapshot write error: %s", e)
-            snapshot_path = None
+            if not _snapshot_is_likely_target(snapshot, name):
+                logging.info("discarding snapshot for %s %s: scored as likely noise", name, event_type)
+                snapshot = None
+        except Exception as exc:
+            logging.warning("snapshot gate error: %s", exc)
+            snapshot = None
+
+        if snapshot:
+            try:
+                ts = int(time.time())
+                _labels = {"VideoMotion": "motion", "SmartMotionHuman": "smart"}
+                label = _labels.get(event_type, event_type.lower()[:8])
+                fname = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(ts)) + f"_{name}_{label}.jpg"
+                snapshot_path = os.path.join(_day_dir(config.SNAPSHOT_DIR, ts), fname)
+                with open(snapshot_path, "wb") as f:
+                    f.write(snapshot)
+            except Exception as e:
+                logging.warning("snapshot write error: %s", e)
+                snapshot_path = None
 
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -367,8 +396,13 @@ def _find_recorded_file(ip, session, ts):
     Returns (path, is_open): Dahua keeps a trailing "_" on the filename while a segment is
     still being written, and stripping it only happens once the recording is finalized —
     downloading it before that produces a footer-less file ffmpeg can't remux."""
+    # The actual recording often doesn't start until 15-20s+ after the event's own timestamp
+    # (observed directly against both cameras), especially for IVS events (CrossLine/CrossRegion/
+    # SmartMotion); mediaFileFind's own StartTime/EndTime condition excludes files whose interval
+    # doesn't overlap the query window at all, so too tight an end boundary here means the file
+    # is never even returned, no matter how many times or how long the caller retries.
     start = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts - 90))
-    end   = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts + 15))
+    end   = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts + 60))
     when  = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
     created = _rpc_call(ip, session, 1, "mediaFileFind.factory.create", {"channel": 0})
     if created.get("error", {}).get("code") == _RPC_SESSION_INVALID:
@@ -393,14 +427,54 @@ def _find_recorded_file(ip, session, ts):
         _rpc_call(ip, session, 4, "mediaFileFind.destroy", None, obj=obj)
 
 
+_FTP_DAV_NAME_RE = re.compile(r"^(\d{2})\.(\d{2})\.(\d{2})-(\d{2})\.(\d{2})\.(\d{2})\[.*\.dav$")
+
+
+def _ftp_dir_for(name):
+    for cam in config.CAMERAS:
+        if cam["name"] == name:
+            return cam.get("ftp_dir")
+    return None
+
+
+def _find_ftp_upload(ftp_dir, ts, tolerance=30):
+    """Check our own ftp/ drop directory directly for the camera's upload covering an event's
+    timestamp. This reflects vsftpd's writes in real time, unlike the camera's mediaFileFind
+    index, which has been observed lagging anywhere from seconds to several minutes behind a
+    completed upload — polling that index isn't a reliable way to tell whether FTP is working."""
+    day_dir = os.path.join(ftp_dir, time.strftime("%Y-%m-%d", time.localtime(ts)), "001", "dav")
+    hours = {time.strftime("%H", time.localtime(ts + delta)) for delta in (-3600, 0, 3600)}
+    for hour in hours:
+        hour_dir = os.path.join(day_dir, hour)
+        if not os.path.isdir(hour_dir):
+            continue
+        for fname in os.listdir(hour_dir):
+            match = _FTP_DAV_NAME_RE.match(fname)
+            if not match:
+                continue
+            h1, m1, s1, h2, m2, s2 = (int(part) for part in match.groups())
+            base = time.localtime(ts)
+            start = time.mktime((base.tm_year, base.tm_mon, base.tm_mday, h1, m1, s1, 0, 0, -1))
+            end = time.mktime((base.tm_year, base.tm_mon, base.tm_mday, h2, m2, s2, 0, 0, -1))
+            if end < start:
+                end += 86400  # recording crossed midnight
+            if start - tolerance <= ts <= end + tolerance:
+                return os.path.join(hour_dir, fname)
+    return None
+
+
+# How long to keep checking our own ftp/ directory for the upload before assuming FTP has
+# actually failed for this event and falling back to the camera's SD "emergency" recording.
+_FTP_UPLOAD_MAX_WAIT = 120
+_FTP_UPLOAD_RETRY_DELAY = 15
+
 # Keep the short live capture available while the camera finishes writing and indexing
 # its own recording. It is only saved if no usable DAV arrives before this deadline.
 # Both cameras only record to the SD card "for emergency" (Local=false, LocalForEmergency=true
-# in RecordStoragePoint) — under normal operation mediaFileFind only ever returns the ftp://
-# path that converter.py already handles, so this window just needs to cover indexing lag for
-# a genuine local recording, not the old (much slower) FTP-indexing case.
-_RECORDED_CLIP_MAX_WAIT = 90
-_RECORDED_CLIP_RETRY_DELAY = 15
+# in RecordStoragePoint), so this path is now only reached once the local ftp/ scan above has
+# given up — i.e. the FTP upload genuinely appears to have failed for this event.
+_RECORDED_CLIP_MAX_WAIT = 300
+_RECORDED_CLIP_RETRY_DELAY = 20
 _pending_live_captures = {}
 _pending_live_captures_lock = threading.Lock()
 
@@ -481,9 +555,33 @@ def _save_live_capture(event_id, name, code):
 
 
 def _fetch_recorded_clip(event_id, name, code, ip, user, pw, ts, started=None):
-    """Actively fetch the camera's own local SD recording for this event via JSON-RPC, used
-    only when the camera's normal FTP upload has failed — the camera never pushes a NewFile
-    event for .dav recordings, only for .jpg snapshots."""
+    """Entry point: check our own ftp/ directory directly for the camera's upload first (fast,
+    no camera-side indexing lag); only fall back to the camera's SD "emergency" recording via
+    JSON-RPC once that upload genuinely appears to be missing."""
+    if started is None:
+        started = time.monotonic()
+
+    ftp_dir = _ftp_dir_for(name)
+    if ftp_dir and _find_ftp_upload(ftp_dir, ts):
+        logging.info("event %s uploaded via FTP (converter.py will handle it), discarding live fallback", event_id)
+        _discard_live_capture(event_id)
+        return
+
+    if time.monotonic() - started < _FTP_UPLOAD_MAX_WAIT:
+        threading.Timer(
+            _FTP_UPLOAD_RETRY_DELAY, _fetch_recorded_clip,
+            args=(event_id, name, code, ip, user, pw, ts, started),
+        ).start()
+        return
+
+    logging.info("event %s not seen in ftp/ after %ss, checking camera's SD emergency recording", event_id, _FTP_UPLOAD_MAX_WAIT)
+    _fetch_sd_recording(event_id, name, code, ip, user, pw, ts)
+
+
+def _fetch_sd_recording(event_id, name, code, ip, user, pw, ts, started=None):
+    """Actively fetch the camera's own local SD recording for this event via JSON-RPC — reached
+    only once the local ftp/ scan above found no upload, i.e. FTP genuinely appears to have
+    failed for this event."""
     if started is None:
         started = time.monotonic()
 
@@ -502,18 +600,17 @@ def _fetch_recorded_clip(event_id, name, code, ip, user, pw, ts, started=None):
         logging.warning("recorded clip lookup failed for event %s: session kept expiring", event_id)
         if time.monotonic() - started < _RECORDED_CLIP_MAX_WAIT:
             threading.Timer(
-                _RECORDED_CLIP_RETRY_DELAY, _fetch_recorded_clip,
+                _RECORDED_CLIP_RETRY_DELAY, _fetch_sd_recording,
                 args=(event_id, name, code, ip, user, pw, ts, started),
             ).start()
         else:
             _save_live_capture(event_id, name, code)
         return
 
-    # An ftp:// path means the recording went to FTP as usual (converter.py already handles
-    # it there and will produce the real clip); the camera only writes locally when FTP upload
-    # fails, so there is no local emergency copy to wait for and no need to keep the fallback.
+    # By this point our own ftp/ scan already gave up, so an ftp:// path here just means the
+    # upload showed up later than that scan window — still nothing local to download.
     if path and path.startswith("ftp://"):
-        logging.info("event %s recorded via FTP only (no local emergency copy), discarding live fallback", event_id)
+        logging.info("event %s recorded via FTP after all (seen via mediaFileFind), discarding live fallback", event_id)
         _discard_live_capture(event_id)
         return
 
@@ -524,7 +621,7 @@ def _fetch_recorded_clip(event_id, name, code, ip, user, pw, ts, started=None):
             reason = "still in progress" if path else "not indexed yet"
             logging.info("recording for event %s %s, retrying in %ss", event_id, reason, _RECORDED_CLIP_RETRY_DELAY)
             threading.Timer(
-                _RECORDED_CLIP_RETRY_DELAY, _fetch_recorded_clip,
+                _RECORDED_CLIP_RETRY_DELAY, _fetch_sd_recording,
                 args=(event_id, name, code, ip, user, pw, ts, started),
             ).start()
         else:
@@ -537,7 +634,7 @@ def _fetch_recorded_clip(event_id, name, code, ip, user, pw, ts, started=None):
     elif time.monotonic() - started < _RECORDED_CLIP_MAX_WAIT:
         logging.info("recording for event %s found but download failed, retrying in %ss", event_id, _RECORDED_CLIP_RETRY_DELAY)
         threading.Timer(
-            _RECORDED_CLIP_RETRY_DELAY, _fetch_recorded_clip,
+            _RECORDED_CLIP_RETRY_DELAY, _fetch_sd_recording,
             args=(event_id, name, code, ip, user, pw, ts, started),
         ).start()
     else:

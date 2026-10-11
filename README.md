@@ -18,10 +18,12 @@ listener.py  →  events.db  →  worker.py  →  Telegram
 
 - **`listener.py`** — starts one persistent HTTPS event stream per camera,
   captures snapshots, stores events in SQLite, and captures clips. For each
-  event it looks up the camera's own SD-card `.dav` recording through
-  `mediaFileFind` and `RPC_Loadfile`, while also using a live RTSP capture as a
-  fallback. FTP-uploaded `.dav` files are processed independently by
-  `converter.py` and are not linked to events by the listener.
+  event it captures six seconds of live RTSP video into memory, then checks the
+  local FTP tree for a matching `.dav` for up to two minutes. If found, the
+  buffer is discarded and `converter.py` handles the FTP file independently.
+  Otherwise it checks the camera's SD-card recording through `mediaFileFind`
+  and `RPC_Loadfile` for up to five more minutes; the live buffer is saved only
+  if neither recording source succeeds.
   It also handles reconnects, disk-space monitoring, and a JSON health
   endpoint.
 - **`worker.py`** — polls unsent events and sends Telegram alerts with optional
@@ -31,11 +33,15 @@ listener.py  →  events.db  →  worker.py  →  Telegram
   menu: live snapshots, recent event history, mute/unmute with reminders,
   event-type filtering, disk usage, and daily status summaries. Muting also
   disables camera email alerts.
-- **`converter.py`** — scans completed FTP `.dav` files oldest-first, converts
-  the first six seconds to smaller H.264/AAC MP4 files at up to 1280 pixels
-  wide, and stores them in `clips/DD-MM/`. Conversion state is tracked in
-  SQLite; failures generate Telegram warnings, and manually deleted outputs
-  are recorded so they are not regenerated indefinitely.
+- **`converter.py`** — scans completed FTP `.dav` files oldest-first and puts
+  the first six seconds into MP4 without re-encoding the original HEVC video.
+  The video stays at its source resolution; the camera's A-law audio is
+  converted to AAC because FFmpeg's MP4 muxer does not support that audio
+  stream. Output is
+  larger than the previous downscaled encode and requires an HEVC-capable
+  player. Conversion state is tracked in SQLite; failures generate Telegram
+  warnings, and manually deleted outputs are recorded to prevent endless
+  regeneration.
 - **`camera-ftp.service`** — accepts camera FTP uploads into `ftp/`; it is
   separate from the four Python application services.
 
@@ -104,10 +110,10 @@ CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... CAMERA_PASS=... python3 converter.py
 
 ## Storage and monitoring
 
-- `events.db` stores event metadata, snapshot paths, fallback clip paths,
-  recorded camera clip paths, and conversion status/output paths. For `left`,
-  the recorded path points into the FTP upload tree after the `.dav` and
-  matching `.idx` files are complete.
+- `events.db` stores event metadata, snapshot paths, live fallback paths,
+  SD-recording paths, and conversion status/output paths. FTP recordings found
+  by the listener are currently handled by the converter independently and are
+  not linked to their triggering event rows.
 - `snapshots/DD-MM/` contains snapshots; `clips/DD-MM/` contains live fallback
   clips and the converter's six-second MP4 review clips.
 - `ftp/` is the FTP upload drop directory, exposed as `/` to the dedicated FTP
@@ -151,9 +157,10 @@ A daily status summary is sent automatically at the configured time
   regardless of the notification filter — the filter only controls whether
   a Telegram message is sent, not whether the event is recorded.
 - The camera's `NewFile` event is reliable for `.jpg` snapshots but not for
-  `.dav` recordings. The listener uses `mediaFileFind` and `RPC_Loadfile` to
-  download the camera's SD-card recording, with live RTSP capture as a
-  fallback. FTP-uploaded `.dav` files are handled separately by the converter.
+  `.dav` recordings. The listener captures live RTSP into memory immediately,
+  checks the local FTP tree for a matching recording for up to 120 seconds,
+  then checks the camera's SD card via `mediaFileFind`/`RPC_Loadfile` for up
+  to 300 seconds. It saves the live capture only if both recording paths fail.
 - The converter processes FTP recordings oldest-first and processes each source
   day once. It records conversion status in SQLite, sends a Telegram warning
   for a failed conversion, and records manually deleted outputs so old clips

@@ -270,10 +270,7 @@ def _convert(source_path, output_path):
         command.extend([
             "-t", str(config.CONVERTER_DURATION),
             "-map", "0:v:0", "-map", "0:a?",
-            "-vf", f"scale='min({config.CONVERTER_WIDTH},iw)':-2",
-            "-c:v", "libx264", "-preset", config.CONVERTER_PRESET,
-            "-crf", str(config.CONVERTER_CRF),
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "64k",
             "-movflags", "+faststart", temporary_path,
         ])
         result = subprocess.run(

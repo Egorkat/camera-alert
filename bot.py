@@ -4,6 +4,8 @@ import requests
 from requests.auth import HTTPDigestAuth
 from urllib3.exceptions import InsecureRequestWarning
 import config
+from tools.feedback import learning_enabled, record_feedback, set_learning_enabled
+from tools.snapshot_probe import score_snapshot
 
 _start_time = time.time()
 
@@ -59,6 +61,16 @@ def _edit(chat_id, message_id, text, keyboard=None):
         logging.warning("edit error: %s", e)
 
 
+def _edit_caption(chat_id, message_id, caption, keyboard=None):
+    try:
+        kwargs = {"chat_id": chat_id, "message_id": message_id, "caption": caption}
+        if keyboard is not None:
+            kwargs["reply_markup"] = {"inline_keyboard": keyboard}
+        _api("editMessageCaption", **kwargs)
+    except Exception as e:
+        logging.warning("caption edit error: %s", e)
+
+
 def _answer_callback(callback_id, text=None):
     def _do():
         try:
@@ -87,7 +99,8 @@ def _main_menu_kb():
          {"text": "🔔 Unmute", "callback_data": "unmute"}],
         [{"text": "🎛 Filter", "callback_data": "filter_menu"},
          {"text": "💾 Disk", "callback_data": "disk"}],
-        [{"text": "❓ Help", "callback_data": "help"}],
+        [{"text": "🧠 Learning" if learning_enabled() else "🧠 Learning off", "callback_data": "learn_toggle"},
+         {"text": "❓ Help", "callback_data": "help"}],
     ]
 
 
@@ -161,6 +174,8 @@ HELP_TEXT = (
     "/filter add <code>   - enable an event type\n"
     "/filter off <code>   - disable an event type\n"
     "/filter reset        - reset to config defaults\n"
+    "/learn on            - enable feedback learning\n"
+    "/learn off           - disable feedback learning\n"
     "/help                - this message"
 )
 
@@ -419,6 +434,23 @@ def _cmd_filter(chat_id, args):
         _reply(chat_id, "Usage: /filter | /filter add <code> | /filter off <code> | /filter reset")
 
 
+def _cmd_learn(chat_id, args):
+    if not args:
+        state = "ON" if learning_enabled() else "OFF"
+        _reply(chat_id, f"Feedback learning is {state}.", keyboard=_back_kb())
+        return
+    mode = args[0].lower()
+    if mode in {"on", "enable", "start"}:
+        set_learning_enabled(True)
+        _reply(chat_id, "Feedback learning enabled. Telegram labels will now affect the score threshold.", keyboard=_back_kb())
+        return
+    if mode in {"off", "disable", "stop"}:
+        set_learning_enabled(False)
+        _reply(chat_id, "Feedback learning disabled. The detector will use the baseline heuristic only.", keyboard=_back_kb())
+        return
+    _reply(chat_id, "Usage: /learn on | /learn off")
+
+
 def _handle_message(msg):
     chat_id = str(msg.get("chat", {}).get("id", ""))
     if chat_id != str(config.CHAT_ID):
@@ -443,6 +475,7 @@ def _handle_message(msg):
         "keepmute": lambda: _cmd_keepmute(chat_id),
         "unmute":   lambda: _cmd_unmute(chat_id),
         "filter":  lambda: _cmd_filter(chat_id, args),
+        "learn":   lambda: _cmd_learn(chat_id, args),
     }
     fn = dispatch.get(command)
     if fn:
@@ -461,7 +494,8 @@ def _handle_callback(cq):
     message_id = cq["message"]["message_id"]
     data       = cq.get("data", "")
     logging.info("CALLBACK %s", data)
-    _answer_callback(cq["id"])
+    if not data.startswith("feedback:"):
+        _answer_callback(cq["id"])
 
     if data == "menu":
         _edit(chat_id, message_id, "Camera Alert menu:", _main_menu_kb())
@@ -504,6 +538,37 @@ def _handle_callback(cq):
         except FileNotFoundError:
             pass
         _edit(chat_id, message_id, "Active alert filter (tap to toggle):", _filter_menu_kb())
+    elif data == "learn_toggle":
+        set_learning_enabled(not learning_enabled())
+        _edit(chat_id, message_id, f"Feedback learning is {'ON' if learning_enabled() else 'OFF'}.", _back_kb())
+    elif data.startswith("feedback:"):
+        _, event_id, label = data.split(":", 2)
+        try:
+            event_id = int(event_id)
+        except ValueError:
+            _answer_callback(cq["id"], "Invalid feedback")
+            return
+        conn = sqlite3.connect(config.DB_PATH)
+        try:
+            row = conn.execute(
+                "SELECT camera, snapshot_path FROM events WHERE id=?",
+                (event_id,),
+            ).fetchone()
+            if not row:
+                _answer_callback(cq["id"], "Event not found")
+                return
+            camera, snapshot_path = row
+            score = 0.0
+            if snapshot_path and os.path.exists(snapshot_path):
+                try:
+                    score = float(score_snapshot(snapshot_path).get("score", 0.0))
+                except Exception:
+                    score = 0.0
+            record_feedback(event_id, camera, label, score)
+            _answer_callback(cq["id"], f"Saved as {label}")
+            _edit_caption(chat_id, message_id, f"Feedback recorded: {label} ({score:.2f})", _back_kb())
+        finally:
+            conn.close()
 
 
 def _daily_status_scheduler():

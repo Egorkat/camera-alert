@@ -18,10 +18,7 @@ SNAPSHOT_DIR  = "/opt/camera-alert/snapshots"
 CLIP_DIR      = "/opt/camera-alert/clips"
 FTP_DIR       = "/opt/camera-alert/ftp"
 CONVERTER_INTERVAL = 15  # seconds between scans for completed DAV uploads
-CONVERTER_WIDTH = 1280  # output width; height is preserved
 CONVERTER_DURATION = 6  # motion alert clips only need the opening seconds
-CONVERTER_CRF = 28  # smaller files while retaining useful review quality
-CONVERTER_PRESET = "veryfast"
 FTP_MATCH_LEAD_SECONDS = 15  # allow camera event delivery to precede FTP recording start
 CLIP_SECONDS  = 6  # length of live RTSP capture held in memory as a fallback
 LOG_DIR       = "/var/log/camera-alert"
@@ -29,6 +26,7 @@ LOG_PATH      = f"{LOG_DIR}/listener.log"
 LOG_KEEP_DAYS = 14  # number of daily log files to keep
 MUTE_FILE     = "/opt/camera-alert/muted"  # presence of this file silences alerts
 FILTER_FILE   = "/opt/camera-alert/filter.json"  # JSON list of active event codes; absent = use EVENT_CODES
+LEARNING_FILE  = "/opt/camera-alert/learning_enabled"  # absent = learning enabled; present = learning disabled
 
 DISK_CHECK_PATH    = "/opt/camera-alert"  # filesystem to monitor for free space
 DISK_CHECK_INTERVAL = 300   # seconds between disk space checks
