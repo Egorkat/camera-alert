@@ -1,0 +1,15 @@
+[Unit]
+Description=Camera Alert DAV converter
+After=network.target camera-ftp.service
+Wants=camera-ftp.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/camera-alert
+EnvironmentFile=/etc/camera-alert.env
+ExecStart=/usr/bin/python3 /opt/camera-alert/converter.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

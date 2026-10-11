@@ -130,6 +130,17 @@ CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... CAMERA_PASS=... python3 converter.py
   default. Set the corresponding `HEALTH_PORT_*` value to `None` to disable
   one.
 
+## UPS notifications
+
+When `apcupsd` is installed on the same Debian host, run
+`sudo ./tools/install_apcupsd_telegram.sh` to route UPS events to the existing
+Telegram chat configured in `/etc/camera-alert.env`. The installer preserves
+existing event scripts as `*.camera-alert-original`; the hook wrapper continues
+to run those scripts before sending Telegram notifications. It covers power
+loss/restoration, UPS communication loss/recovery, battery replacement, and
+low-battery shutdown events. Check the rendered message without sending it
+with `python3 tools/apcupsd_telegram.py --dry-run onbattery`.
+
 ## Telegram bot usage
 
 Send `/menu` for the interactive button interface, or use text commands
