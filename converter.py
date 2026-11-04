@@ -104,7 +104,7 @@ def _camera_label(source_path):
     parts = os.path.normpath(source_path).split(os.sep)
     for camera in config.CAMERAS:
         if os.path.basename(camera.get("ftp_dir", "")) in parts:
-            return camera["name"]
+            return camera.get("clip_label", camera["name"])
     return "camera"
 
 

@@ -14,6 +14,14 @@ import converter
 
 
 class DeletedOutputTrackingTests(unittest.TestCase):
+    def test_center_camera_clips_use_ogorod_suffix(self):
+        source_path = (
+            "/opt/camera-alert/ftp/Dacha3/2026-10-28/001/dav/"
+            "10/10.00.00-10.00.10[M][0@0][0].dav"
+        )
+
+        self.assertEqual(converter._camera_label(source_path), "ogorod")
+
     def test_missing_converted_output_is_marked_deleted(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "events.db")

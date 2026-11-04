@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
+import argparse
 import hashlib
 import os
 import requests
 from requests.auth import HTTPDigestAuth
+from urllib3.exceptions import InsecureRequestWarning
 
 CAMERA_USER = os.environ.get("CAMERA_USER", "admin")
 CAMERA_PASS = os.environ.get("CAMERA_PASS", "")
-IPS = ["10.30.0.201", "10.30.0.202"]
+IPS = ["10.30.0.201", "10.30.0.202", "10.30.0.24"]
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 CONFIG_NAMES = [
     "MotionDetect",
     "VideoAnalyseRule",
@@ -112,23 +115,63 @@ def cgi_get_config(ip: str, user: str, pw: str, name: str):
     return resp.status_code, resp.text[:2000]
 
 
-if not CAMERA_PASS:
-    print("CAMERA_PASS is not set. Source /etc/camera-alert.env or export it before running this script.")
-    raise SystemExit(1)
-
-for ip in IPS:
-    print(f"\n=== {ip} ===")
-    session = dahua_login(ip, CAMERA_USER, CAMERA_PASS)
-    if not session:
-        continue
+def print_summary():
     for name in CONFIG_NAMES:
-        for variant_idx, make_params in enumerate(CONFIG_PARAM_VARIANTS, start=1):
-            params = make_params(name)
-            status, body = get_config(ip, session, name, params=params)
-            print(f"[{name}] variant={variant_idx} params={params} status={status}")
-            print(body)
-            print("---")
-        cgi_status, cgi_body = cgi_get_config(ip, CAMERA_USER, CAMERA_PASS, name)
-        print(f"[{name}] CGI status={cgi_status}")
-        print(cgi_body)
-        print("===")
+        responses = {}
+        for ip in IPS:
+            status, body = cgi_get_config(ip, CAMERA_USER, CAMERA_PASS, name)
+            if status == 200:
+                responses[ip] = {
+                    line.split("=", 1)[0]: line.split("=", 1)[1]
+                    for line in body.splitlines()
+                    if "=" in line and not line.startswith("table")
+                }
+
+        keys = set().union(*(set(values) for values in responses.values()))
+        differences = sorted(
+            key for key in keys
+            if len({responses[ip].get(key, "<missing>") for ip in IPS if ip in responses}) > 1
+        )
+        if differences:
+            print(f"\n[{name}]")
+            for key in differences:
+                values = " | ".join(
+                    f"{ip}={responses[ip].get(key, '<missing>')}"
+                    for ip in IPS if ip in responses
+                )
+                print(f"{key}: {values}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--summary", action="store_true")
+    args = parser.parse_args()
+
+    if not CAMERA_PASS:
+        print("CAMERA_PASS is not set. Source /etc/camera-alert.env or export it before running this script.")
+        raise SystemExit(1)
+
+    if args.summary:
+        print_summary()
+        return
+
+    for ip in IPS:
+        print(f"\n=== {ip} ===")
+        session = dahua_login(ip, CAMERA_USER, CAMERA_PASS)
+        if not session:
+            continue
+        for name in CONFIG_NAMES:
+            for variant_idx, make_params in enumerate(CONFIG_PARAM_VARIANTS, start=1):
+                params = make_params(name)
+                status, body = get_config(ip, session, name, params=params)
+                print(f"[{name}] variant={variant_idx} params={params} status={status}")
+                print(body)
+                print("---")
+            cgi_status, cgi_body = cgi_get_config(ip, CAMERA_USER, CAMERA_PASS, name)
+            print(f"[{name}] CGI status={cgi_status}")
+            print(cgi_body)
+            print("===")
+
+
+if __name__ == "__main__":
+    main()
