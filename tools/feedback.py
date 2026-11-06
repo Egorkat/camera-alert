@@ -1,5 +1,7 @@
+import json
 import os
 import sqlite3
+import time
 
 import config
 
@@ -52,7 +54,7 @@ def record_feedback(event_id, camera, label, score):
     ensure_feedback_table(conn)
     conn.execute(
         "INSERT INTO feedback (event_id, camera, label, score, ts) VALUES (?, ?, ?, ?, ?)",
-        (event_id, camera, label, float(score), int(__import__("time").time())),
+        (event_id, camera, label, float(score), int(time.time())),
     )
     conn.commit()
     conn.close()
@@ -95,3 +97,154 @@ def should_accept_snapshot(camera, score):
         return float(score) >= 0.5
     threshold = adaptive_threshold(camera)
     return float(score) >= threshold
+
+
+def ensure_box_feedback_table(conn=None):
+    should_close = conn is None
+    conn = conn or sqlite3.connect(config.DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS box_feedback (
+            event_id INTEGER PRIMARY KEY,
+            camera TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            snapshot_path TEXT NOT NULL,
+            predicted_boxes TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(
+                status IN ('pending', 'correct', 'awaiting_correction', 'corrected', 'no_object')
+            ),
+            alert_message_id INTEGER,
+            prompt_message_id INTEGER,
+            corrected_bbox TEXT,
+            marked_image_path TEXT,
+            ts INTEGER NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    if should_close:
+        conn.close()
+
+
+def register_box_feedback(event_id, camera, event_type, snapshot_path, predicted_boxes, alert_message_id):
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        ensure_box_feedback_table(conn)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO box_feedback (
+                event_id, camera, event_type, snapshot_path, predicted_boxes,
+                status, alert_message_id, prompt_message_id, corrected_bbox,
+                marked_image_path, ts
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL, ?)
+            """,
+            (
+                event_id,
+                camera,
+                event_type,
+                snapshot_path,
+                json.dumps(predicted_boxes),
+                alert_message_id,
+                int(time.time()),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def record_box_vote(event_id, correct):
+    status = "correct" if correct else "awaiting_correction"
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        ensure_box_feedback_table(conn)
+        updated = conn.execute(
+            "UPDATE box_feedback SET status=? WHERE event_id=?",
+            (status, event_id),
+        )
+        conn.commit()
+        return updated.rowcount > 0
+    finally:
+        conn.close()
+
+
+def has_box_feedback(event_id):
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        ensure_box_feedback_table(conn)
+        return conn.execute(
+            "SELECT 1 FROM box_feedback WHERE event_id=?",
+            (event_id,),
+        ).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def set_box_correction_prompt(event_id, prompt_message_id):
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        ensure_box_feedback_table(conn)
+        updated = conn.execute(
+            """
+            UPDATE box_feedback
+            SET prompt_message_id=?
+            WHERE event_id=? AND status='awaiting_correction'
+            """,
+            (prompt_message_id, event_id),
+        )
+        conn.commit()
+        return updated.rowcount > 0
+    finally:
+        conn.close()
+
+
+def pending_box_feedback(prompt_message_id):
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        ensure_box_feedback_table(conn)
+        return conn.execute(
+            """
+            SELECT event_id, snapshot_path
+            FROM box_feedback
+            WHERE prompt_message_id=? AND status='awaiting_correction'
+            """,
+            (prompt_message_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def record_box_correction(event_id, corrected_bbox, marked_image_path):
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        ensure_box_feedback_table(conn)
+        updated = conn.execute(
+            """
+            UPDATE box_feedback
+            SET status='corrected', corrected_bbox=?, marked_image_path=?
+            WHERE event_id=? AND status='awaiting_correction'
+            """,
+            (json.dumps(corrected_bbox), marked_image_path, event_id),
+        )
+        conn.commit()
+        return updated.rowcount > 0
+    finally:
+        conn.close()
+
+
+def record_no_object(event_id):
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        ensure_box_feedback_table(conn)
+        updated = conn.execute(
+            """
+            UPDATE box_feedback
+            SET status='no_object'
+            WHERE event_id=? AND status='awaiting_correction'
+            """,
+            (event_id,),
+        )
+        conn.commit()
+        return updated.rowcount > 0
+    finally:
+        conn.close()

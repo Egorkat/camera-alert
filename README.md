@@ -25,7 +25,10 @@ listener.py  →  events.db  →  worker.py  →  Telegram
   and `RPC_Loadfile` for up to five more minutes; the live buffer is saved only
   if neither recording source succeeds.
   It also handles reconnects, disk-space monitoring, and a JSON health
-  endpoint.
+  endpoint. Accepted snapshots are checked with a local YOLO object detector;
+  supported person, animal, and vehicle detections are outlined when found.
+  The model is downloaded on first use and cached locally. No rectangle is
+  drawn when the detector finds no supported object.
 - **`worker.py`** — polls unsent events and sends Telegram alerts with optional
   snapshots, applying the active event-type filter and mute state. Events that
   are filtered or muted are marked processed; only send failures are retried.
@@ -47,7 +50,7 @@ listener.py  →  events.db  →  worker.py  →  Telegram
 
 ## Requirements
 
-- Python 3 with `requests`
+- Python 3 with `requests` and `opencv-python-headless` 4.12.0.88
 - `ffmpeg` (for MP4 conversion and live RTSP fallback capture)
 - One or more Dahua/Dahua-OEM cameras with HTTP API access enabled
 - A Telegram bot token ([@BotFather](https://t.me/BotFather)) and your chat ID
@@ -83,10 +86,13 @@ sudo ./install.sh
 ```
 
 This installs system dependencies (`ffmpeg`, `python3-requests`, and
-`vsftpd`), creates the `snapshots/`, `clips/`, and `ftp/` directories, writes a
-secrets template to `/etc/camera-alert.env`, and installs four Python systemd
-units plus the FTP systemd unit. The FTP server listens on port 21 and accepts
-uploads into `/opt/camera-alert/ftp` using a dedicated local account. Then:
+`vsftpd`), creates an isolated listener environment with OpenCV 4.12, creates
+the `snapshots/`, `clips/`, and `ftp/` directories, writes a secrets template
+to `/etc/camera-alert.env`, and installs four Python systemd units plus the FTP
+systemd unit. The FTP server listens on port 21 and accepts
+uploads into `/opt/camera-alert/ftp` using a dedicated local account. The
+listener downloads the object-detection model on first use and caches it under
+the service account's home directory. Then:
 
 1. Edit `/etc/camera-alert.env` with your real Telegram bot token, chat ID,
    camera credentials, and FTP credentials if needed.
@@ -102,7 +108,7 @@ The installation path must be `/opt/camera-alert` because the paths in
 ## Running manually (without systemd)
 
 ```bash
-CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... CAMERA_PASS=... python3 listener.py
+CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... CAMERA_PASS=... .venv/bin/python listener.py
 CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... python3 worker.py
 CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... python3 bot.py
 CAMERA_BOT_TOKEN=... CAMERA_CHAT_ID=... CAMERA_PASS=... python3 converter.py
@@ -161,6 +167,16 @@ directly:
 
 A daily status summary is sent automatically at the configured time
 (`DAILY_STATUS_HOUR`/`DAILY_STATUS_MINUTE` in `config.py`).
+
+When all feedback collection is ON, alerts include classification buttons and
+box feedback buttons for snapshots, even when the detector finds no object.
+Choose whether the box is correct (or no box is needed) or wrong / missing.
+Mark a correction by replying to the correction prompt with the image containing
+one bright-red rectangle around the object; reply `none` if there is no target.
+These responses are stored alongside the original snapshot as training examples;
+they do not retrain the detector automatically. Use `/learn off` or the menu
+toggle to stop collecting both classification and box feedback; `/learn on`
+enables them again.
 
 ## Notes and limitations
 

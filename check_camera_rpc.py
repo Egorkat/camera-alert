@@ -8,7 +8,7 @@ from urllib3.exceptions import InsecureRequestWarning
 
 CAMERA_USER = os.environ.get("CAMERA_USER", "admin")
 CAMERA_PASS = os.environ.get("CAMERA_PASS", "")
-IPS = ["10.30.0.201", "10.30.0.202", "10.30.0.24"]
+IPS = ["10.30.0.201", "10.30.0.202", "10.30.0.203"]
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 CONFIG_NAMES = [
     "MotionDetect",

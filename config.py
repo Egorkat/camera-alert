@@ -6,7 +6,7 @@ CHAT_ID   = os.environ["CAMERA_CHAT_ID"]
 CAMERAS = [
     {"name": "left",   "ip": "10.30.0.201", "ftp_dir": "/opt/camera-alert/ftp/Dacha2"},
     {"name": "right",  "ip": "10.30.0.202", "ftp_dir": "/opt/camera-alert/ftp/Dacha1"},
-    {"name": "center", "ip": "10.30.0.24", "ftp_dir": "/opt/camera-alert/ftp/Dacha3", "clip_label": "ogorod"},
+    {"name": "center", "ip": "10.30.0.203", "ftp_dir": "/opt/camera-alert/ftp/Dacha3", "clip_label": "ogorod"},
     # Per-camera credentials are optional; falls back to CAMERA_USER/CAMERA_PASS:
     # {"name": "gate", "ip": "10.30.0.203", "user": "viewer", "pass": "secret"},
 ]

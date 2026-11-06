@@ -22,7 +22,11 @@ fi
 
 echo "==> Installing system dependencies"
 apt-get update -qq
-apt-get install -y python3 python3-requests python3-urllib3 ffmpeg openssl vsftpd
+apt-get install -y python3 python3-venv python3-pip python3-requests python3-urllib3 ffmpeg openssl vsftpd
+
+echo "==> Setting up the listener object-detection runtime"
+python3 -m venv --system-site-packages "$REPO_DIR/.venv"
+"$REPO_DIR/.venv/bin/python" -m pip install -r "$REPO_DIR/tools/dav-vision-probe/requirements.txt"
 
 echo "==> Creating data directories"
 mkdir -p "$REPO_DIR/snapshots" "$REPO_DIR/clips" "$REPO_DIR/ftp"
@@ -117,6 +121,10 @@ EOF
 
 echo "==> Installing systemd units"
 for svc in listener worker bot converter; do
+    app_python="/usr/bin/python3"
+    if [[ "$svc" == "listener" ]]; then
+        app_python="$REPO_DIR/.venv/bin/python"
+    fi
     cat > "/etc/systemd/system/camera-$svc.service" << EOF
 [Unit]
 Description=Camera Alert $svc
@@ -127,7 +135,7 @@ $( [[ "$svc" != "listener" ]] && echo "Wants=camera-listener.service" )
 Type=simple
 WorkingDirectory=$REPO_DIR
 EnvironmentFile=$ENV_FILE
-ExecStart=/usr/bin/python3 $REPO_DIR/$svc.py
+ExecStart=$app_python $REPO_DIR/$svc.py
 Restart=on-failure
 RestartSec=5
 
@@ -138,6 +146,7 @@ done
 
 systemctl daemon-reload
 systemctl enable --now camera-ftp.service
+systemctl try-restart camera-listener.service
 
 echo "==> Done"
 echo "1. Edit $ENV_FILE with your Telegram bot token, chat id, and camera credentials"

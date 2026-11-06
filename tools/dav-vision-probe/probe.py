@@ -1,77 +1,17 @@
 #!/usr/bin/env python3
 import argparse
-import importlib.util
 import json
-import os
 import shutil
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-
-MODEL_URL = (
-    "https://github.com/opencv/opencv_zoo/raw/refs/heads/main/models/"
-    "object_detection_yolox/object_detection_yolox_2022nov_int8bq.onnx"
-)
-WRAPPER_URL = (
-    "https://raw.githubusercontent.com/opencv/opencv_zoo/main/models/"
-    "object_detection_yolox/yolox.py"
-)
-MODEL_DIR = Path.home() / ".cache" / "camera-alert-dav-probe"
-INPUT_SIZE = 640
-COCO_CLASSES = (
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
-    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
-    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep",
-    "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
-    "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
-    "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
-    "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
-    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
-    "couch", "potted plant", "bed", "dining table", "toilet", "tv",
-    "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
-    "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
-    "scissors", "teddy bear", "hair drier", "toothbrush",
-)
-
-
-def _download(url, destination, minimum_size):
-    if destination.is_file() and destination.stat().st_size >= minimum_size:
-        return
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + ".download")
-    request = urllib.request.Request(url, headers={"User-Agent": "camera-alert-dav-probe"})
-    with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as output:
-        shutil.copyfileobj(response, output)
-    if temporary.stat().st_size < minimum_size:
-        temporary.unlink(missing_ok=True)
-        raise RuntimeError(f"Downloaded file is unexpectedly small: {destination.name}")
-    temporary.replace(destination)
-
-
-def _load_model():
-    wrapper_path = MODEL_DIR / "yolox.py"
-    model_path = MODEL_DIR / "yolox_int8bq.onnx"
-    _download(WRAPPER_URL, wrapper_path, 1000)
-    _download(MODEL_URL, model_path, 1_000_000)
-
-    spec = importlib.util.spec_from_file_location("opencv_zoo_yolox", wrapper_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.YoloX(
-        str(model_path),
-        confThreshold=0.35,
-        objThreshold=0.25,
-        backendId=cv2.dnn.DNN_BACKEND_OPENCV,
-        targetId=cv2.dnn.DNN_TARGET_CPU,
-    )
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.object_detector import COCO_CLASSES, INPUT_SIZE, letterbox_image, load_model
 
 
 def _dhav_offset(path):
@@ -97,18 +37,6 @@ def _read_exact(stream, size):
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
-
-
-def _letterbox(frame):
-    height, width = frame.shape[:2]
-    scale = min(INPUT_SIZE / height, INPUT_SIZE / width)
-    resized_width = int(width * scale)
-    resized_height = int(height * scale)
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    resized = cv2.resize(rgb, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
-    canvas = np.full((INPUT_SIZE, INPUT_SIZE, 3), 114, dtype=np.uint8)
-    canvas[:resized_height, :resized_width] = resized
-    return canvas.astype(np.float32), scale
 
 
 def _analyze_file(path, model, interval, max_frames):
@@ -148,7 +76,7 @@ def _analyze_file(path, model, interval, max_frames):
                 frame = np.frombuffer(raw, dtype=np.uint8).reshape(
                     INPUT_SIZE, INPUT_SIZE, 3
                 )
-                model_input, scale = _letterbox(frame)
+                model_input, scale = letterbox_image(frame)
                 inference_start = time.perf_counter()
                 predictions = model.infer(model_input)
                 inference_seconds += time.perf_counter() - inference_start
@@ -215,7 +143,7 @@ def main():
 
     cv2.setNumThreads(args.threads)
     print("Loading OpenCV Zoo quantized YOLOX model on CPU...", file=sys.stderr)
-    model = _load_model()
+    model = load_model()
 
     reports = []
     for path in args.dav_files:

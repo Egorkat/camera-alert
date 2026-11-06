@@ -16,6 +16,7 @@ import config
 from urllib3.exceptions import InsecureRequestWarning
 
 from tools.feedback import learning_enabled, should_accept_snapshot
+from tools.object_detector import detect_objects
 from tools.snapshot_probe import score_snapshot
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
@@ -271,28 +272,44 @@ def _day_dir(base_dir, ts):
 
 
 def _snapshot_is_likely_target(snapshot_bytes, camera_name):
+    accepted, _ = _classify_snapshot(snapshot_bytes, camera_name)
+    return accepted
+
+
+def _classify_snapshot(snapshot_bytes, camera_name):
     if not snapshot_bytes:
-        return False
+        return False, None
     if learning_enabled():
-        return True
+        try:
+            return True, score_snapshot(snapshot_bytes)
+        except Exception as exc:
+            logging.warning("snapshot scoring failed: %s", exc)
+            return True, None
     try:
         result = score_snapshot(snapshot_bytes)
         score = float(result.get("score", 0.0))
         if result.get("likely_human_or_animal"):
-            return should_accept_snapshot(camera_name, score)
-        return False
+            return should_accept_snapshot(camera_name, score), result
+        return False, result
     except Exception as exc:
         logging.warning("snapshot scoring failed: %s", exc)
-        return False
+        return False, None
 
 
 def save_event(name, ip, event_type, raw, snapshot):
     snapshot_path = None
+    detections = []
     if snapshot:
         try:
-            if not _snapshot_is_likely_target(snapshot, name):
+            accepted, _ = _classify_snapshot(snapshot, name)
+            if not accepted:
                 logging.info("discarding snapshot for %s %s: scored as likely noise", name, event_type)
                 snapshot = None
+            else:
+                try:
+                    detections = detect_objects(snapshot)
+                except Exception as exc:
+                    logging.warning("snapshot object detection failed for %s: %s", name, exc)
         except Exception as exc:
             logging.warning("snapshot gate error: %s", exc)
             snapshot = None
@@ -314,14 +331,15 @@ def save_event(name, ip, event_type, raw, snapshot):
     c = conn.cursor()
 
     c.execute("""
-        INSERT INTO events (ts, camera, event_type, raw, snapshot_path, sent)
-        VALUES (?, ?, ?, ?, ?, 0)
+        INSERT INTO events (ts, camera, event_type, raw, snapshot_path, bbox, sent)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
     """, (
         int(time.time()),
         name,
         event_type,
         raw,
         snapshot_path,
+        json.dumps(detections),
     ))
 
     conn.commit()
@@ -562,8 +580,22 @@ def _fetch_recorded_clip(event_id, name, code, ip, user, pw, ts, started=None):
         started = time.monotonic()
 
     ftp_dir = _ftp_dir_for(name)
-    if ftp_dir and _find_ftp_upload(ftp_dir, ts):
-        logging.info("event %s uploaded via FTP (converter.py will handle it), discarding live fallback", event_id)
+    ftp_path = _find_ftp_upload(ftp_dir, ts) if ftp_dir else None
+    if ftp_path:
+        conn = sqlite3.connect(DB)
+        try:
+            conn.execute(
+                "UPDATE events SET recorded_clip_path=? WHERE id=? AND recorded_clip_path IS NULL",
+                (ftp_path, event_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        logging.info(
+            "event %s uploaded via FTP: %s (converter.py will handle it), discarding live fallback",
+            event_id,
+            ftp_path,
+        )
         _discard_live_capture(event_id)
         return
 

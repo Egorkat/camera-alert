@@ -9,6 +9,14 @@ import requests
 import config
 
 
+_EVENT_CLIP_LABELS = {
+    "SmartMotionHuman": "smart",
+    "SmartMotionVehicle": "smart",
+    "CrossRegionDetection": "crossreg",
+    "CrossLineDetection": "crosslin",
+}
+
+
 def _notify_conversion_failure(source_path, error):
     conn = sqlite3.connect(config.DB_PATH)
     try:
@@ -108,10 +116,30 @@ def _camera_label(source_path):
     return "camera"
 
 
-def _output_path(source_path):
+def _output_path(source_path, use_event_name=True):
     output_dir = _day_output_dir(source_path)
     if not output_dir:
         return None
+
+    if use_event_name:
+        conn = sqlite3.connect(config.DB_PATH)
+        try:
+            events = conn.execute(
+                "SELECT ts, event_type FROM events WHERE recorded_clip_path=? ORDER BY ts, id",
+                (source_path,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        for ts, event_type in events:
+            label = _EVENT_CLIP_LABELS.get(event_type)
+            if label and ts is not None:
+                timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(ts))
+                return os.path.join(
+                    output_dir,
+                    f"{timestamp}_{_camera_label(source_path)}_{label}.mp4",
+                )
+
     basename = os.path.splitext(os.path.basename(source_path))[0]
     return os.path.join(output_dir, f"{basename}_{_camera_label(source_path)}.mp4")
 
@@ -195,6 +223,7 @@ def _find_next_recording():
         conn.close()
 
     candidates = []
+    linked_source_paths = {row[0] for row in linked}
     for (source_path, status, current_output, _) in linked:
         day = _day_key(source_path)
         if day in processed_days:
@@ -218,12 +247,14 @@ def _find_next_recording():
         for filename in files:
             if filename.lower().endswith(".dav"):
                 source_path = os.path.join(root, filename)
+                if source_path in linked_source_paths:
+                    continue
                 day = _day_key(source_path)
                 if day in processed_days:
                     continue
                 if source_path in failed or source_path in deleted:
                     continue
-                output_path = _output_path(source_path)
+                output_path = _output_path(source_path, use_event_name=False)
                 if output_path and not os.path.exists(output_path):
                     candidates.append((os.path.getmtime(source_path), source_path, output_path))
 

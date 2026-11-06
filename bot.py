@@ -1,11 +1,22 @@
 import os, time, json, sqlite3, logging, logging.handlers, datetime, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
+import cv2
 from requests.auth import HTTPDigestAuth
 from urllib3.exceptions import InsecureRequestWarning
 import config
-from tools.feedback import learning_enabled, record_feedback, set_learning_enabled
-from tools.snapshot_probe import score_snapshot
+from tools.feedback import (
+    learning_enabled,
+    has_box_feedback,
+    pending_box_feedback,
+    record_box_correction,
+    record_box_vote,
+    record_feedback,
+    record_no_object,
+    set_box_correction_prompt,
+    set_learning_enabled,
+)
+from tools.snapshot_probe import extract_red_rectangle, score_snapshot
 
 _start_time = time.time()
 
@@ -41,14 +52,105 @@ def _api(method, **kwargs):
     return r.json()
 
 
-def _reply(chat_id, text, keyboard=None):
+def _reply(chat_id, text, keyboard=None, reply_to_message_id=None, force_reply=False):
     try:
         kwargs = {"chat_id": chat_id, "text": text}
         if keyboard is not None:
             kwargs["reply_markup"] = {"inline_keyboard": keyboard}
-        _api("sendMessage", **kwargs)
+        elif force_reply:
+            kwargs["reply_markup"] = {"force_reply": True, "selective": True}
+        if reply_to_message_id is not None:
+            kwargs["reply_to_message_id"] = reply_to_message_id
+        return _api("sendMessage", **kwargs).get("result")
     except Exception as e:
         logging.warning("reply error: %s", e)
+        return None
+
+
+def _download_telegram_photo(message):
+    photos = message.get("photo") or []
+    if not photos:
+        raise ValueError("Reply with the marked-up image as a photo")
+
+    photo = max(photos, key=lambda item: item.get("file_size", 0))
+    file_info = _api("getFile", file_id=photo["file_id"]).get("result") or {}
+    file_path = file_info.get("file_path")
+    if not file_path:
+        raise RuntimeError("Telegram did not return a file path for the correction image")
+    if file_info.get("file_size", 0) > 20 * 1024 * 1024:
+        raise ValueError("Correction image is too large; send it as a compressed photo")
+
+    response = requests.get(
+        f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{file_path}",
+        timeout=30,
+    )
+    response.raise_for_status()
+    if len(response.content) > 20 * 1024 * 1024:
+        raise ValueError("Correction image is too large; send it as a compressed photo")
+    return response.content
+
+
+def _handle_box_correction(message, chat_id, event_id, snapshot_path):
+    marked_bytes = _download_telegram_photo(message)
+    corrected_bbox, (marked_width, marked_height) = extract_red_rectangle(marked_bytes)
+
+    original = cv2.imread(snapshot_path, cv2.IMREAD_COLOR)
+    if original is None:
+        raise ValueError("Could not read the original event snapshot")
+    original_height, original_width = original.shape[:2]
+    x, y, width, height = corrected_bbox
+    scaled_bbox = [
+        round(x * original_width / marked_width),
+        round(y * original_height / marked_height),
+        round(width * original_width / marked_width),
+        round(height * original_height / marked_height),
+    ]
+
+    feedback_dir = os.path.join(config.SNAPSHOT_DIR, "box-feedback")
+    os.makedirs(feedback_dir, mode=0o777, exist_ok=True)
+    marked_path = os.path.join(feedback_dir, f"event-{event_id}-correction.jpg")
+    with open(marked_path, "wb") as image_file:
+        image_file.write(marked_bytes)
+    os.chmod(marked_path, 0o666)
+
+    if not record_box_correction(event_id, scaled_bbox, marked_path):
+        raise ValueError("This box correction was already submitted")
+    _reply(chat_id, "Thanks — saved the corrected box with the original snapshot as a training example.")
+
+
+def _handle_pending_box_reply(message, chat_id):
+    reply_to = message.get("reply_to_message") or {}
+    if not reply_to.get("message_id"):
+        return False
+    pending = pending_box_feedback(reply_to["message_id"])
+    if not pending:
+        return False
+
+    if not learning_enabled():
+        _reply(chat_id, "Feedback collection is OFF. Enable it with /learn on to submit this correction.")
+        return True
+
+    event_id, snapshot_path = pending
+    text = (message.get("text") or "").strip().lower()
+    if text in {"/none", "none"}:
+        if record_no_object(event_id):
+            _reply(chat_id, "Thanks — saved this as a false detection for training.")
+        else:
+            _reply(chat_id, "This box feedback was already submitted.")
+        return True
+
+    try:
+        _handle_box_correction(message, chat_id, event_id, snapshot_path)
+    except Exception as exc:
+        logging.warning("box correction failed for event %s: %s", event_id, exc)
+        _reply(
+            chat_id,
+            f"Could not save the correction: {exc}\n"
+            "Reply to the original correction prompt with the image marked using one bright red rectangle, "
+            "or reply `none` if there is no target.",
+            reply_to_message_id=reply_to["message_id"],
+        )
+    return True
 
 
 def _edit(chat_id, message_id, text, keyboard=None):
@@ -89,6 +191,13 @@ def _back_kb():
     return [[{"text": "⬅️ Menu", "callback_data": "menu"}]]
 
 
+def _box_vote_keyboard(event_id):
+    return [[
+        {"text": "📦 Box OK / none needed", "callback_data": f"box:{event_id}:yes"},
+        {"text": "↩️ Box wrong / missing", "callback_data": f"box:{event_id}:no"},
+    ]]
+
+
 def _main_menu_kb():
     return [
         [{"text": "📊 Status", "callback_data": "status"},
@@ -99,7 +208,7 @@ def _main_menu_kb():
          {"text": "🔔 Unmute", "callback_data": "unmute"}],
         [{"text": "🎛 Filter", "callback_data": "filter_menu"},
          {"text": "💾 Disk", "callback_data": "disk"}],
-        [{"text": "🧠 Learning" if learning_enabled() else "🧠 Learning off", "callback_data": "learn_toggle"},
+        [{"text": f"🧠 Feedback: {'ON' if learning_enabled() else 'OFF'}", "callback_data": "learn_toggle"},
          {"text": "❓ Help", "callback_data": "help"}],
     ]
 
@@ -437,16 +546,16 @@ def _cmd_filter(chat_id, args):
 def _cmd_learn(chat_id, args):
     if not args:
         state = "ON" if learning_enabled() else "OFF"
-        _reply(chat_id, f"Feedback learning is {state}.", keyboard=_back_kb())
+        _reply(chat_id, f"All feedback collection is {state}.", keyboard=_back_kb())
         return
     mode = args[0].lower()
     if mode in {"on", "enable", "start"}:
         set_learning_enabled(True)
-        _reply(chat_id, "Feedback learning enabled. Telegram labels will now affect the score threshold.", keyboard=_back_kb())
+        _reply(chat_id, "All feedback collection enabled.", keyboard=_back_kb())
         return
     if mode in {"off", "disable", "stop"}:
         set_learning_enabled(False)
-        _reply(chat_id, "Feedback learning disabled. The detector will use the baseline heuristic only.", keyboard=_back_kb())
+        _reply(chat_id, "All feedback collection disabled. New alerts will not include feedback buttons.", keyboard=_back_kb())
         return
     _reply(chat_id, "Usage: /learn on | /learn off")
 
@@ -455,6 +564,8 @@ def _handle_message(msg):
     chat_id = str(msg.get("chat", {}).get("id", ""))
     if chat_id != str(config.CHAT_ID):
         logging.warning("Ignored message from unauthorised chat_id %s", chat_id)
+        return
+    if _handle_pending_box_reply(msg, chat_id):
         return
     text = msg.get("text", "").strip()
     if not text.startswith("/"):
@@ -494,7 +605,7 @@ def _handle_callback(cq):
     message_id = cq["message"]["message_id"]
     data       = cq.get("data", "")
     logging.info("CALLBACK %s", data)
-    if not data.startswith("feedback:"):
+    if not data.startswith(("feedback:", "box:")):
         _answer_callback(cq["id"])
 
     if data == "menu":
@@ -540,8 +651,48 @@ def _handle_callback(cq):
         _edit(chat_id, message_id, "Active alert filter (tap to toggle):", _filter_menu_kb())
     elif data == "learn_toggle":
         set_learning_enabled(not learning_enabled())
-        _edit(chat_id, message_id, f"Feedback learning is {'ON' if learning_enabled() else 'OFF'}.", _back_kb())
+        state = "ON" if learning_enabled() else "OFF"
+        _edit(chat_id, message_id, f"All feedback collection is {state}.", _back_kb())
+    elif data.startswith("box:"):
+        if not learning_enabled():
+            _answer_callback(cq["id"], "Feedback collection is OFF")
+            return
+        try:
+            _, event_id_text, vote = data.split(":", 2)
+            event_id = int(event_id_text)
+        except ValueError:
+            _answer_callback(cq["id"], "Invalid box feedback")
+            return
+        if vote == "yes":
+            if record_box_vote(event_id, True):
+                _edit_caption(chat_id, message_id, "Box feedback saved: correct.", _back_kb())
+                _answer_callback(cq["id"], "Saved")
+            else:
+                _answer_callback(cq["id"], "Box feedback not found")
+        elif vote == "no":
+            if not record_box_vote(event_id, False):
+                _answer_callback(cq["id"], "Box feedback not found")
+                return
+            prompt = _reply(
+                chat_id,
+                "Reply to this message with the same photo marked using one bright red rectangle "
+                "around the correct object. Reply `none` if there is no target.",
+                reply_to_message_id=message_id,
+                force_reply=True,
+            )
+            prompt_message_id = (prompt or {}).get("message_id")
+            if prompt_message_id and set_box_correction_prompt(event_id, prompt_message_id):
+                _edit_caption(chat_id, message_id, "Box marked incorrect; waiting for your correction.")
+                _answer_callback(cq["id"], "Send the marked photo as a reply")
+            else:
+                logging.error("could not create box-correction prompt for event %s", event_id)
+                _answer_callback(cq["id"], "Could not start correction; try again")
+        else:
+            _answer_callback(cq["id"], "Invalid box feedback")
     elif data.startswith("feedback:"):
+        if not learning_enabled():
+            _answer_callback(cq["id"], "Feedback collection is OFF")
+            return
         _, event_id, label = data.split(":", 2)
         try:
             event_id = int(event_id)
@@ -566,7 +717,15 @@ def _handle_callback(cq):
                     score = 0.0
             record_feedback(event_id, camera, label, score)
             _answer_callback(cq["id"], f"Saved as {label}")
-            _edit_caption(chat_id, message_id, f"Feedback recorded: {label} ({score:.2f})", _back_kb())
+            if has_box_feedback(event_id):
+                _edit_caption(
+                    chat_id,
+                    message_id,
+                    f"Feedback recorded: {label} ({score:.2f})",
+                    _box_vote_keyboard(event_id),
+                )
+            else:
+                _edit_caption(chat_id, message_id, f"Feedback recorded: {label} ({score:.2f})", _back_kb())
         finally:
             conn.close()
 

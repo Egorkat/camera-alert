@@ -98,6 +98,99 @@ def score_snapshot(image_or_path):
     }
 
 
+def annotate_snapshot(image_bytes, bbox):
+    img = _as_bgr_image(image_bytes)
+    if len(bbox) != 4:
+        raise ValueError("Expected bounding box as (x, y, width, height)")
+
+    x, y, width, height = (int(value) for value in bbox)
+    if width <= 0 or height <= 0:
+        raise ValueError("Bounding box dimensions must be positive")
+
+    cv2.rectangle(
+        img,
+        (x, y),
+        (x + width, y + height),
+        (0, 255, 0),
+        max(2, min(img.shape[:2]) // 360),
+    )
+    encoded, result = cv2.imencode(".jpg", img)
+    if not encoded:
+        raise ValueError("Could not encode annotated snapshot")
+    return result.tobytes()
+
+
+def annotate_detections(image_bytes, detections):
+    img = _as_bgr_image(image_bytes)
+    thickness = max(2, min(img.shape[:2]) // 360)
+    for detection in detections:
+        x, y, width, height = (int(value) for value in detection["bbox"])
+        if width <= 0 or height <= 0:
+            continue
+        cv2.rectangle(img, (x, y), (x + width, y + height), (0, 255, 0), thickness)
+        label = detection["label"]
+        cv2.putText(
+            img,
+            label,
+            (x, max(thickness * 4, y - thickness)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            max(0.6, min(img.shape[:2]) / 1200),
+            (0, 255, 0),
+            thickness,
+            cv2.LINE_AA,
+        )
+    encoded, result = cv2.imencode(".jpg", img)
+    if not encoded:
+        raise ValueError("Could not encode annotated snapshot")
+    return result.tobytes()
+
+
+def extract_red_rectangle(image_bytes):
+    img = _as_bgr_image(image_bytes)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    red = cv2.bitwise_or(
+        cv2.inRange(hsv, (0, 100, 80), (10, 255, 255)),
+        cv2.inRange(hsv, (170, 100, 80), (180, 255, 255)),
+    )
+    red = cv2.morphologyEx(
+        red,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+    )
+    contours, _ = cv2.findContours(red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    image_height, image_width = img.shape[:2]
+    candidates = []
+    for contour in contours:
+        x, y, width, height = cv2.boundingRect(contour)
+        if width < image_width * 0.04 or height < image_height * 0.04:
+            continue
+        if width * height > image_width * image_height * 0.8:
+            continue
+
+        thickness = max(2, min(width, height) // 20)
+        roi = red[y:y + height, x:x + width]
+        top = roi[:thickness, :]
+        bottom = roi[-thickness:, :]
+        left = roi[:, :thickness]
+        right = roi[:, -thickness:]
+        edge_coverage = (
+            cv2.countNonZero(top) / max(1, top.size),
+            cv2.countNonZero(bottom) / max(1, bottom.size),
+            cv2.countNonZero(left) / max(1, left.size),
+            cv2.countNonZero(right) / max(1, right.size),
+        )
+        if sum(coverage >= 0.2 for coverage in edge_coverage) < 3:
+            continue
+        candidates.append([x, y, width, height])
+
+    if len(candidates) != 1:
+        raise ValueError(
+            "Could not identify exactly one red rectangle; mark one box with a bright red outline"
+        )
+    return candidates[0], (image_width, image_height)
+
+
 def _iter_snapshot_files(root):
     root = Path(root)
     if root.is_file():

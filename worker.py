@@ -8,7 +8,12 @@ import logging.handlers
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import config
-from tools.feedback import learning_enabled
+from tools.feedback import (
+    ensure_box_feedback_table,
+    learning_enabled,
+    register_box_feedback,
+)
+from tools.snapshot_probe import annotate_detections
 
 
 def _start_health(port, get_status):
@@ -42,12 +47,22 @@ def event_allowed(event_type):
     return event_type in active_filter()
 
 
-def _feedback_keyboard(event_id):
-    return [[
+def _feedback_keyboard(event_id, has_snapshot=False):
+    if not learning_enabled():
+        return []
+
+    rows = []
+    rows.append([
         {"text": "✅ Human", "callback_data": f"feedback:{event_id}:human"},
         {"text": "🐾 Animal", "callback_data": f"feedback:{event_id}:animal"},
         {"text": "🚫 Noise", "callback_data": f"feedback:{event_id}:noise"},
-    ]]
+    ])
+    if has_snapshot:
+        rows.append([
+            {"text": "📦 Box OK / none needed", "callback_data": f"box:{event_id}:yes"},
+            {"text": "↩️ Box wrong / missing", "callback_data": f"box:{event_id}:no"},
+        ])
+    return rows
 
 
 def send_telegram(text, image=None, keyboard=None):
@@ -77,9 +92,11 @@ def send_telegram(text, image=None, keyboard=None):
                 data=payload,
                 timeout=15,
             )
-        logging.debug("Telegram %s %s", r.status_code, r.text[:100])
         r.raise_for_status()
-        return True
+        response = r.json()
+        if not response.get("ok"):
+            raise RuntimeError(f"Telegram API rejected the message: {response}")
+        return response.get("result")
 
     except Exception as e:
         logging.error("Telegram error: %s", e)
@@ -96,6 +113,8 @@ def run():
     ))
     logging.getLogger().addHandler(handler)
     logging.getLogger().setLevel(logging.INFO)
+    with sqlite3.connect(config.DB_PATH) as conn:
+        ensure_box_feedback_table(conn)
     logging.info("Worker started, polling DB")
 
     if config.HEALTH_PORT_WORKER:
@@ -117,7 +136,7 @@ def run():
                 c = conn.cursor()
 
                 rows = c.execute("""
-                    SELECT id, camera, event_type, raw, snapshot_path
+                    SELECT id, camera, event_type, raw, snapshot_path, bbox
                     FROM events
                     WHERE sent = 0
                 """).fetchall()
@@ -125,19 +144,28 @@ def run():
                 logging.debug("found %d unsent events", len(rows))
 
                 for r in rows:
-                    eid, cam, etype, raw, snap_path = r
+                    eid, cam, etype, raw, snap_path, bbox_json = r
 
                     logging.info("event %s: camera=%s type=%s", eid, cam, etype)
 
                     msg = f"🚨 {cam} — {etype}"
 
                     snap = None
+                    detections = []
                     if snap_path and os.path.exists(snap_path):
                         try:
                             with open(snap_path, "rb") as f:
                                 snap = f.read()
                         except Exception as e:
                             logging.warning("could not read snapshot %s: %s", snap_path, e)
+                    if bbox_json:
+                        try:
+                            detections = json.loads(bbox_json)
+                            if snap and detections:
+                                snap = annotate_detections(snap, detections)
+                        except Exception as e:
+                            logging.warning("could not annotate snapshot for event %s: %s", eid, e)
+                            detections = []
 
                     if not event_allowed(etype):
                         logging.info("filtered %s, skipping event %s", etype, eid)
@@ -151,8 +179,22 @@ def run():
                         conn.commit()
                         continue
 
-                    keyboard = _feedback_keyboard(eid) if learning_enabled() else None
-                    if send_telegram(msg, snap, keyboard):
+                    has_snapshot = bool(snap_path and snap)
+                    keyboard = _feedback_keyboard(eid, has_snapshot) or None
+                    sent_message = send_telegram(msg, snap, keyboard)
+                    if sent_message:
+                        if learning_enabled() and has_snapshot and isinstance(sent_message, dict):
+                            try:
+                                register_box_feedback(
+                                    eid,
+                                    cam,
+                                    etype,
+                                    snap_path,
+                                    detections,
+                                    sent_message["message_id"],
+                                )
+                            except Exception:
+                                logging.exception("could not register box feedback for event %s", eid)
                         c.execute("UPDATE events SET sent=1 WHERE id=?", (eid,))
                         conn.commit()
                         logging.info("sent event %s", eid)
