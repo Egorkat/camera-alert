@@ -1,0 +1,8 @@
+[Unit]
+Description=Sync previous day's camera clips to NAS
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/camera-alert/tools/sync_yesterday_clips.sh

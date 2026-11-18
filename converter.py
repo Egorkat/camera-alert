@@ -82,8 +82,8 @@ def _mark_day_processed(source_path, status="processed"):
     day = _day_key(source_path)
     if not day:
         return
-    if day >= time.strftime("%Y-%m-%d"):
-        return  # never mark today (or later) as done — more clips can still arrive before midnight
+    if day >= time.strftime("%Y-%m-%d") and status != "deleted":
+        return  # new clips can still arrive; explicit deletion tombstones are permanent
     conn = sqlite3.connect(config.DB_PATH)
     try:
         conn.execute(
@@ -219,8 +219,23 @@ def _find_next_recording():
                GROUP BY recorded_clip_path
                ORDER BY MIN(ts)"""
         ).fetchall()
+        converted = conn.execute(
+            """SELECT DISTINCT recorded_clip_path, converted_clip_path
+               FROM events
+               WHERE recorded_clip_path IS NOT NULL
+                 AND conversion_status='converted'"""
+        ).fetchall()
     finally:
         conn.close()
+
+    for source_path, output_path in converted:
+        day = _day_key(source_path)
+        if day in processed_days:
+            continue
+        if _mark_deleted_if_missing(source_path, output_path):
+            _mark_day_processed(source_path, "deleted")
+            if day:
+                processed_days.add(day)
 
     candidates = []
     linked_source_paths = {row[0] for row in linked}
@@ -238,6 +253,8 @@ def _find_next_recording():
         if status == 'converted':
             if _mark_deleted_if_missing(source_path, output_path):
                 _mark_day_processed(source_path, "deleted")
+                if day:
+                    processed_days.add(day)
                 continue
             continue
         if _dhav_offset(source_path) not in (None, 0):
@@ -258,6 +275,12 @@ def _find_next_recording():
                 if output_path and not os.path.exists(output_path):
                     candidates.append((os.path.getmtime(source_path), source_path, output_path))
 
+    if not candidates:
+        return None
+    candidates = [
+        candidate for candidate in candidates
+        if _day_key(candidate[1]) not in processed_days
+    ]
     if not candidates:
         return None
     _, source_path, output_path = min(candidates, key=lambda item: item[0])

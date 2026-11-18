@@ -22,7 +22,7 @@ fi
 
 echo "==> Installing system dependencies"
 apt-get update -qq
-apt-get install -y python3 python3-venv python3-pip python3-requests python3-urllib3 ffmpeg openssl vsftpd
+apt-get install -y python3 python3-venv python3-pip python3-requests python3-urllib3 ffmpeg openssl vsftpd rsync openssh-client
 
 echo "==> Setting up the listener object-detection runtime"
 python3 -m venv --system-site-packages "$REPO_DIR/.venv"
@@ -31,6 +31,7 @@ python3 -m venv --system-site-packages "$REPO_DIR/.venv"
 echo "==> Creating data directories"
 mkdir -p "$REPO_DIR/snapshots" "$REPO_DIR/clips" "$REPO_DIR/ftp"
 install -d -m 0755 /var/log/camera-alert
+install -d -m 0700 /var/lib/camera-alert/nas-cleanup-pending /var/lib/camera-alert/nas-cleanup-done
 
 echo "==> Writing environment file template"
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -144,12 +145,21 @@ WantedBy=multi-user.target
 EOF
 done
 
+echo "==> Installing nightly NAS clip sync units"
+install -m 0644 "$REPO_DIR/camera-clips-sync.service" /etc/systemd/system/camera-clips-sync.service
+install -m 0644 "$REPO_DIR/camera-clips-sync.timer" /etc/systemd/system/camera-clips-sync.timer
+install -m 0644 "$REPO_DIR/camera-clips-cleanup.service" /etc/systemd/system/camera-clips-cleanup.service
+install -m 0644 "$REPO_DIR/camera-clips-cleanup.timer" /etc/systemd/system/camera-clips-cleanup.timer
+
 systemctl daemon-reload
 systemctl enable --now camera-ftp.service
+systemctl enable --now camera-clips-sync.timer
+systemctl enable --now camera-clips-cleanup.timer
 systemctl try-restart camera-listener.service
 
 echo "==> Done"
 echo "1. Edit $ENV_FILE with your Telegram bot token, chat id, and camera credentials"
 echo "2. Edit config.py CAMERAS list with your camera IPs"
 echo "3. FTP user: $ftp_user (password is in $ENV_FILE)"
-echo "4. Start everything: systemctl enable --now camera-listener camera-worker camera-bot"
+echo "4. Configure /root/.ssh/camera-alert-clips for master@10.10.0.50 (see README)"
+echo "5. Start everything: systemctl enable --now camera-listener camera-worker camera-bot"

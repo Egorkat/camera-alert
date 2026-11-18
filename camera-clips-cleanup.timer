@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for NAS clip folders pending cleanup
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=camera-clips-cleanup.service
+
+[Install]
+WantedBy=timers.target

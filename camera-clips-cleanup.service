@@ -1,0 +1,8 @@
+[Unit]
+Description=Clean reviewed camera clips after NAS deletion
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/camera-alert/tools/nas_clip_cleanup.py

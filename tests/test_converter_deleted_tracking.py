@@ -2,6 +2,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, "/opt/camera-alert")
@@ -210,6 +211,68 @@ class DeletedOutputTrackingTests(unittest.TestCase):
             conn.close()
 
             self.assertIsNone(converter._find_next_recording())
+
+    def test_deleted_day_folder_suppresses_unlinked_recordings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "events.db")
+            ftp_dir = os.path.join(tmpdir, "ftp")
+            clip_dir = os.path.join(tmpdir, "clips")
+            converter.config.DB_PATH = db_path
+            converter.config.FTP_DIR = ftp_dir
+            converter.config.CLIP_DIR = clip_dir
+
+            day = time.strftime("%Y-%m-%d")
+            source_dir = os.path.join(ftp_dir, day, "001", "dav", "00")
+            os.makedirs(source_dir)
+            linked_source = os.path.join(source_dir, "linked.dav")
+            unlinked_source = os.path.join(source_dir, "unlinked.dav")
+            for source_path in (linked_source, unlinked_source):
+                with open(source_path, "wb") as handle:
+                    handle.write(b"prefixDHAVsuffix")
+
+            output_dir = converter._day_output_dir(linked_source)
+            os.makedirs(output_dir)
+            output_path = os.path.join(output_dir, "linked.mp4")
+            with open(output_path, "wb") as handle:
+                handle.write(b"converted")
+            os.unlink(output_path)
+            os.rmdir(output_dir)
+
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                CREATE TABLE events (
+                    id INTEGER PRIMARY KEY,
+                    ts INTEGER,
+                    recorded_clip_path TEXT,
+                    converted_clip_path TEXT,
+                    conversion_status TEXT NOT NULL DEFAULT 'unknown',
+                    conversion_error TEXT
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO events (recorded_clip_path, converted_clip_path, conversion_status) VALUES (?, ?, ?)",
+                (linked_source, output_path, "converted"),
+            )
+            conn.commit()
+            conn.close()
+
+            self.assertIsNone(converter._find_next_recording())
+
+            conn = sqlite3.connect(db_path)
+            status = conn.execute(
+                "SELECT conversion_status FROM events WHERE recorded_clip_path=?",
+                (linked_source,),
+            ).fetchone()[0]
+            day_status = conn.execute(
+                "SELECT status FROM processed_days WHERE day=?",
+                (day,),
+            ).fetchone()[0]
+            conn.close()
+
+            self.assertEqual(status, "deleted")
+            self.assertEqual(day_status, "deleted")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly sync of camera clips to NAS
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+Unit=camera-clips-sync.service
+
+[Install]
+WantedBy=timers.target

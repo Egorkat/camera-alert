@@ -43,8 +43,8 @@ listener.py  →  events.db  →  worker.py  →  Telegram
   stream. Output is
   larger than the previous downscaled encode and requires an HEVC-capable
   player. Conversion state is tracked in SQLite; failures generate Telegram
-  warnings, and manually deleted outputs are recorded to prevent endless
-  regeneration.
+  warnings. If a previously converted output disappears, that date is marked
+  deleted so FTP files for that day are not regenerated.
 - **`camera-ftp.service`** — accepts camera FTP uploads into `ftp/`; it is
   separate from the four Python application services.
 
@@ -85,14 +85,16 @@ cd /opt/camera-alert
 sudo ./install.sh
 ```
 
-This installs system dependencies (`ffmpeg`, `python3-requests`, and
-`vsftpd`), creates an isolated listener environment with OpenCV 4.12, creates
-the `snapshots/`, `clips/`, and `ftp/` directories, writes a secrets template
-to `/etc/camera-alert.env`, and installs four Python systemd units plus the FTP
-systemd unit. The FTP server listens on port 21 and accepts
-uploads into `/opt/camera-alert/ftp` using a dedicated local account. The
-listener downloads the object-detection model on first use and caches it under
-the service account's home directory. Then:
+This installs system dependencies (`ffmpeg`, `python3-requests`, `vsftpd`,
+`rsync`, and `openssh-client`), creates an isolated listener environment with
+OpenCV 4.12, creates the `snapshots/`, `clips/`, and `ftp/` directories, writes
+a secrets template to `/etc/camera-alert.env`, and installs four Python
+systemd units plus the FTP systemd unit and a nightly clip-sync timer. The FTP
+server listens on port 21 and accepts uploads into `/opt/camera-alert/ftp`
+using a dedicated local account. It also installs a cleanup timer that checks
+for NAS date folders deleted after a successful sync. The listener downloads
+the object-detection model on first use and caches it under the service
+account's home directory. Then:
 
 1. Edit `/etc/camera-alert.env` with your real Telegram bot token, chat ID,
    camera credentials, and FTP credentials if needed.
@@ -104,6 +106,67 @@ the service account's home directory. Then:
 
 The installation path must be `/opt/camera-alert` because the paths in
 `config.py` are absolute.
+
+### Nightly NAS clip sync
+
+The installer enables `camera-clips-sync.timer`, which runs daily at 02:30
+server-local time. It copies only the previous day's clips to
+`master@10.10.0.50:/home/video/YYYY-MM-DD/` using rsync over SSH. Local clips
+are retained until the matching NAS date folder is removed. The source folder
+is named `DD-MM`; the destination uses the full date to keep separate years
+distinct. A timer missed while the host is off runs once on return and syncs
+the then-previous day.
+
+On the camera-alert host, create a dedicated root SSH key and authorize it for
+the `master` account on the NAS:
+
+```bash
+sudo install -d -m 0700 /root/.ssh
+sudo ssh-keygen -t ed25519 -N '' -f /root/.ssh/camera-alert-clips
+```
+
+The NAS offers only the legacy `aes128-cbc` cipher. Keep the compatibility
+exception limited to this NAS connection. First, compare the NAS host-key
+fingerprint shown on the NAS with the prompt from this command on the
+camera-alert host; accept the host key only if they match:
+
+```bash
+sudo ssh -o Ciphers=+aes128-cbc master@10.10.0.50
+```
+
+Then authorize the key (this may prompt for the NAS account password):
+
+```bash
+sudo ssh-copy-id -o Ciphers=+aes128-cbc \
+  -i /root/.ssh/camera-alert-clips.pub master@10.10.0.50
+```
+
+Ensure `/home/video` exists on the NAS and is writable by `master`. Confirm
+passwordless access and permissions with:
+
+```bash
+sudo ssh -i /root/.ssh/camera-alert-clips -o BatchMode=yes \
+  -o Ciphers=+aes128-cbc master@10.10.0.50 'test -w /home/video'
+```
+
+The sync runs as root, requires the NAS host key to be trusted, and reports
+transfer failures in the systemd journal (`journalctl -u camera-clips-sync`).
+To run it manually, use `sudo systemctl start camera-clips-sync.service`.
+
+After a successful sync, the sync service writes a hidden success marker under
+`/home/video/.camera-alert-sync-state/`. The cleanup timer checks every
+15 minutes. If a marked NAS date folder is absent continuously for 24 hours,
+it removes the matching local `clips/DD-MM/` and all matching `YYYY-MM-DD/`
+directories under `ftp/`. It records the date as deleted for the converter and
+temporarily stops the converter during cleanup. Restoring the NAS date folder
+within 24 hours cancels the pending cleanup. Today's and non-current-year dates
+are never automatically cleaned, because local clip folder names do not
+include a year.
+
+Existing NAS folders synced before this feature have no success marker. Run
+`sudo systemctl start camera-clips-sync.service` once for the current
+previous-day folder to create its marker. To inspect cleanup activity, use
+`journalctl -u camera-clips-cleanup.service`.
 
 ## Running manually (without systemd)
 
